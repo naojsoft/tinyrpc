@@ -81,3 +81,29 @@ class ClientTransport(object):
         :rtype: bytes
         """
         raise NotImplementedError
+
+
+class AsyncClientTransport(object):
+    def send_message(self, message: bytes, expect_reply: bool = True) -> bytes:
+        raise NotImplementedError
+
+    def send_message_noblock(self, message: bytes) -> None:
+        raise NotImplementedError
+
+    def receive_reply(self, timeout: Any = None) -> bytes:
+        raise NotImplementedError
+
+
+class AsyncClientContext:
+
+    def done(self):
+        raise NotImplementedError
+
+    def result(self, timeout=None):
+        raise NotImplementedError
+
+    def add_done_callback(self, fn):
+        raise NotImplementedError
+
+    def set_result(self, result):
+        raise NotImplementedError

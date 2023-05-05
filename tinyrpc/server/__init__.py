@@ -7,6 +7,7 @@ Defines and implements a single-threaded, single-process, synchronous server.
 
 # FIXME: needs (more) unittests
 # FIXME: needs checks for out-of-order, concurrency, etc as attributes
+import asyncio
 from typing import Any, Callable
 
 import tinyrpc.exc
@@ -35,13 +36,13 @@ class RPCServer(object):
     When this attribute is set to a callable this callable will be called directly
     after a message has been received and immediately after a reply is sent.
     The callable should accept three positional parameters:
-    
+
     :param str direction: Either '-->' for incoming or '<--' for outgoing data.
     :param any context: The context returned by :py:meth:`~tinyrpc.transports.ServerTransport.receive_message`.
     :param bytes message: The message itself.
 
     Example:
-    
+
     .. code-block:: python
 
         def my_trace(direction, context, message):
@@ -52,7 +53,7 @@ class RPCServer(object):
         server.serve_forever()
 
     will log all incoming and outgoing traffic of the RPC service.
-    
+
     Note that the ``message`` will be the data stream that is transported,
     not the interpreted meaning of that data.
     It is therefore possible that the binary stream is unreadable without further translation.
@@ -100,6 +101,7 @@ class RPCServer(object):
             """Parse, process and reply a single request."""
             try:
                 request = self.protocol.parse_request(message)
+                #print(f"received {request.unique_id}")
             except tinyrpc.exc.RPCError as e:
                 response = e.error_respond()
             else:
@@ -110,6 +112,7 @@ class RPCServer(object):
             # send reply
             if response is not None:
                 result = response.serialize()
+                #print(f"reply {response.unique_id}")
                 if callable(self.trace):
                     self.trace('<--', context, result)
                 self.transport.send_reply(context, result)
@@ -130,3 +133,86 @@ class RPCServer(object):
         :param kwargs: Keyword arguments to ``func``.
         """
         func(*args, **kwargs)
+
+
+class AsyncRPCServer(RPCServer):
+
+    def __init__(
+            self, transport: ServerTransport, protocol: RPCProtocol,
+            dispatcher: RPCDispatcher
+    ):
+        super().__init__(transport, protocol, dispatcher)
+
+        self.tasks = set()
+
+    async def serve_forever(self) -> None:
+        """Handle requests forever.
+
+        Starts the server loop; continuously calling :py:meth:`receive_one_message`
+        to process the next incoming request.
+        """
+        task = asyncio.create_task(self.transport.start())
+        self.tasks.add(task)
+        while True:
+            await self.receive_one_message()
+
+    async def receive_one_message(self) -> None:
+        """Handle a single request.
+
+        Polls the transport for a new message.
+
+        After a new message has arrived :py:meth:`_spawn` is called with a handler
+        function and arguments to handle the request.
+
+        The handler function will try to decode the message using the supplied
+        protocol, if that fails, an error response will be sent. After decoding
+        the message, the dispatcher will be asked to handle the resulting
+        request and the return value (either an error or a result) will be sent
+        back to the client using the transport.
+        """
+        context, message = await self.transport.receive_message()
+        if callable(self.trace):
+            self.trace('-->', context, message)
+
+        # assuming protocol is thread-safe and dispatcher is thread-safe, as
+        # long as its immutable
+
+        async def handle_message(context: Any, message: bytes) -> None:
+            """Parse, process and reply a single request."""
+            try:
+                request = self.protocol.parse_request(message)
+                #print(f"received {request.unique_id}")
+            except tinyrpc.exc.RPCError as e:
+                response = e.error_respond()
+            else:
+                response = self.dispatcher.dispatch(
+                    request, getattr(self.protocol, '_caller', None)
+                )
+
+            # send reply
+            if response is not None:
+                result = response.serialize()
+                #print(f"reply {response.unique_id}")
+                if callable(self.trace):
+                    self.trace('<--', context, result)
+                await self.transport.send_reply(context, result)
+
+        self._spawn(handle_message, context, message)
+
+    def _spawn(self, func: Callable, *args, **kwargs):
+        """Spawn a handler function.
+
+        This function is overridden in subclasses to provide concurrency.
+
+        In the base implementation, it simply calls the supplied function
+        ``func`` with ``*args`` and ``**kwargs``. This results in a
+        single-threaded, single-process, synchronous server.
+
+        :param func: A callable to call.
+        :param args: Arguments to ``func``.
+        :param kwargs: Keyword arguments to ``func``.
+        """
+        # TODO: how to limit to N tasks?
+        task = asyncio.create_task(func(*args, **kwargs))
+        self.tasks.add(task)
+        task.add_done_callback(self.tasks.discard)

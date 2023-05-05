@@ -7,7 +7,8 @@ from typing import List, Any, Dict, Callable, Optional
 
 from .transports import ClientTransport
 from .exc import RPCError
-from .protocols import RPCErrorResponse, RPCProtocol, RPCRequest, RPCResponse, RPCBatchResponse
+from .protocols import (RPCErrorResponse, RPCProtocol, RPCRequest,
+                        RPCResponse, RPCBatchResponse)
 
 RPCCall = namedtuple('RPCCall', 'method args kwargs')
 """Defines the elements of an RPC call.
@@ -44,7 +45,8 @@ class RPCClient(object):
             req: RPCRequest,
             one_way: bool = False,
             transport: ClientTransport = None,
-            no_exception: bool = False
+            no_exception: bool = False,
+            timeout: Any = None,
     ) -> Optional[RPCResponse]:
         tport = self.transport if transport is None else transport
 
@@ -70,7 +72,8 @@ class RPCClient(object):
         return response
 
     def call(
-            self, method: str, args: List, kwargs: Dict, one_way: bool = False
+            self, method: str, args: List, kwargs: Dict,
+            one_way: bool = False, timeout: Any = None
     ) -> Any:
         """Calls the requested method and returns the result.
 
@@ -86,7 +89,7 @@ class RPCClient(object):
         """
         req = self.protocol.create_request(method, args, kwargs, one_way)
 
-        rep = self._send_and_handle_reply(req, one_way)
+        rep = self._send_and_handle_reply(req, one_way, timeout=timeout)
 
         if one_way:
             return
