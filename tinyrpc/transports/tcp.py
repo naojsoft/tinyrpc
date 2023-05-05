@@ -375,14 +375,15 @@ class AsyncTcpClientTransport(AsyncClientTransport):
 
         self.process_events()
 
-    def send_message(self, message: bytes, expect_reply: bool = True) -> bytes:
+    def send_message(self, message: bytes, expect_reply: bool = True,
+                     timeout: Any = None) -> bytes:
 
         self.send_message_noblock(message)
 
         if not expect_reply:
             return
 
-        return self.receive_reply(timeout=None)
+        return self.receive_reply(timeout=timeout)
 
 
 class TransportPacker:

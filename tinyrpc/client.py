@@ -46,12 +46,19 @@ class RPCClient(object):
             one_way: bool = False,
             transport: ClientTransport = None,
             no_exception: bool = False,
-            timeout: Any = None,
+            timeout: Any = None
     ) -> Optional[RPCResponse]:
         tport = self.transport if transport is None else transport
 
+        kwargs = dict(expect_reply=not one_way)
+        if timeout is not None:
+            # only add timeout to kwargs if not None to preserve
+            # backward compatibility with transports that have no
+            # timeout capability
+            kwargs['timeout'] = timeout
+
         # sends ...
-        reply = tport.send_message(req.serialize(), expect_reply=(not one_way))
+        reply = tport.send_message(req.serialize(), **kwargs)
 
         if one_way:
             # ... and be done
@@ -74,6 +81,7 @@ class RPCClient(object):
     def call(
             self, method: str, args: List, kwargs: Dict,
             one_way: bool = False, timeout: Any = None
+
     ) -> Any:
         """Calls the requested method and returns the result.
 
@@ -84,12 +92,13 @@ class RPCClient(object):
         :param list args: Arguments to pass to the method.
         :param dict kwargs: Keyword arguments to pass to the method.
         :param bool one_way: Whether or not a reply is desired.
+        :param Any timeout: (float) Seconds until timeout or (None) no timeout
         :return: The result of the call
         :rtype: any
         """
         req = self.protocol.create_request(method, args, kwargs, one_way)
 
-        rep = self._send_and_handle_reply(req, one_way, timeout=timeout)
+        rep = self._send_and_handle_reply(req, one_way=one_way, timeout=timeout)
 
         if one_way:
             return

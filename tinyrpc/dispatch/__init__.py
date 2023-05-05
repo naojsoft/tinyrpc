@@ -291,14 +291,14 @@ class RPCDispatcher(object):
         if hasattr(method, '__code__'):
             try:
                 inspect.getcallargs(method, *args, **kwargs)
-            except TypeError:
-                raise exc.InvalidParamsError()
+            except TypeError as e:
+                raise exc.InvalidParamsError("invalid parameters for method")
 
     validator = validate_parameters
     """Dispatched function parameter validation.
 
     :type: callable
-    
+
     By default this attribute is set to :py:func:`validate_parameters`.
     The value can be set to any callable implementing the same interface
     as :py:func:`validate_parameters` or to `None` to disable validation
