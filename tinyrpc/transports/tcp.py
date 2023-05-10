@@ -19,31 +19,26 @@ max_pkt_size = 4096
 
 class ConnectionlessTcpClientTransport(ClientTransport):
 
-    def __init__(self, endpoint: tuple[str, int], timeout: float =1.0,
+    def __init__(self, endpoint: tuple[str, int],
+                 packer: Any = None,
                  **kwargs) -> None:
         self.endpoint = endpoint
-        self.timeout = timeout
-        self.procedure_timeout = timeout
-        #self.request_kwargs = kwargs
-
-    # use this for procedures that take a long time to complete
-    @contextlib.contextmanager
-    def settimeout(self, procedure_timeout: float):
-        try:
-            self.procedure_timeout = procedure_timeout
-            yield
-        finally:
-            self.procedure_timeout = self.timeout
+        if packer is None:
+            packer = TransportPacker()
+        self.packer = packer
 
     def send_message(self, message: bytes, expect_reply: bool =True) -> bytes:
 
         with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
-            sock.settimeout(self.timeout)
             sock.connect(self.endpoint)
-            sock.settimeout(self.procedure_timeout)
-            sock.sendall(message)
+
+            self.packer.send(sock, message)
             if expect_reply:
-                return sock.recv(max_pkt_size)
+                try:
+                    recv_data = self.packer.recv(sock)
+                except ConnectionError as e:
+                    recv_data = b''
+                return recv_data
 
 
 class ConnectionlessTcpServerTransport(ServerTransport):
@@ -53,34 +48,45 @@ class ConnectionlessTcpServerTransport(ServerTransport):
                    endpoint.
     """
 
-    def __init__(self, sock: Any) -> None:
+    def __init__(self, sock: Any,
+                 packer: Any = None,
+                 ) -> None:
         self.sock = sock
+        if packer is None:
+            packer = TransportPacker()
+        self.packer = packer
 
     def receive_message(self) -> Tuple[Any, bytes]:
         sock, addr = self.sock.accept()
-        msg = sock.recv(max_pkt_size)
-        if not msg:
+        try:
+            msg = self.packer.recv(sock)
+        except ConnectionError as e:
+            msg = b''
+        if len(msg) == 0:
             raise ValueError("socket error: no data received")
 
         return sock, msg
 
     def send_reply(self, sock: Any, reply: bytes) -> None:
         with sock:
-            sock.sendall(reply)
+            self.packer.send(sock, reply)
 
     @classmethod
-    def create(cls, endpoint: tuple[str, int]) -> 'ConnectionlessTcpServerTransport':
+    def create(cls, endpoint: tuple[str, int], backlog: int = 0,
+               packer: Any = None) -> 'ConnectionlessTcpServerTransport':
         """Create new server transport.
 
-        Instead of creating the socket yourself, you can call this function and
-        merely pass the :py:class:`zmq.core.context.Context` instance.
+        Instead of creating the socket yourself, you can call this function
+        with the (host, port) endpoint.
 
         :param endpoint: The endpoint clients will connect to.
+        :param backlog: The number of pending connections to allow.
         """
         sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         sock.bind(endpoint)
-        sock.listen(5)
-        return cls(sock)
+        sock.listen(backlog)
+        return cls(sock, packer=packer)
 
 
 class TcpClientTransport(ClientTransport):
@@ -92,11 +98,8 @@ class TcpClientTransport(ClientTransport):
 
     def __init__(self,
                  endpoint: tuple[str, int],
-                 packer: Any = None,
-                 timeout: Any = None) -> None:
+                 packer: Any = None) -> None:
         self.endpoint = endpoint
-        self.timeout = timeout
-        self.procedure_timeout = timeout
         if packer is None:
             packer = TransportPacker()
         self.packer = packer
@@ -104,12 +107,9 @@ class TcpClientTransport(ClientTransport):
 
     def connect(self):
         self.sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        if self.timeout is not None:
-            self.sock.settimeout(self.timeout)
         self.sock.connect(self.endpoint)
 
     def send_message(self, message: bytes, expect_reply: bool =True) -> bytes:
-        #self.sock.settimeout(self.procedure_timeout)
         self.packer.send(self.sock, message)
         if expect_reply:
             try:
@@ -244,8 +244,8 @@ class TcpServerTransport(ServerTransport):
         ctx.outbox.append(reply)
 
     @classmethod
-    def create(cls, endpoint: tuple[str, int], backlog: int = 0) \
-        -> 'TcpServerTransport':
+    def create(cls, endpoint: tuple[str, int], backlog: int = 0,
+               packer: Any = None) -> 'TcpServerTransport':
         """Create new server transport.
 
         Instead of creating the socket yourself, you can call this function
@@ -258,17 +258,15 @@ class TcpServerTransport(ServerTransport):
         sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         sock.bind(endpoint)
         sock.listen(backlog)
-        return cls(sock)
+        return cls(sock, packer=packer)
 
 
 class AsyncTcpClientTransport(AsyncClientTransport):
 
     def __init__(self,
                  endpoint: tuple[str, int],
-                 packer: Any = None,
-                 timeout: float = 1.0) -> None:
+                 packer: Any = None) -> None:
         self.endpoint = endpoint
-        self.timeout = timeout
         self.lock = threading.RLock()
         self.sel = selectors.DefaultSelector()
         self.incoming = queue.Queue()
@@ -282,8 +280,6 @@ class AsyncTcpClientTransport(AsyncClientTransport):
 
     def connect(self):
         conn_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        # if self.timeout is not None:
-        #     conn_sock.settimeout(self.timeout)
         conn_sock.connect(self.endpoint)
         # create a Transport context to be passed around as needed
         ctx = SimpleNamespace(sock=conn_sock,
