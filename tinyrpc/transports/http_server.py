@@ -72,6 +72,13 @@ class _RPCRequestHandler(BaseHTTPRequestHandler):
     # transport's ``keep_alive`` setting.
     protocol_version = 'HTTP/1.1'
 
+    # The handler writes headers and body as separate sends, so with Nagle on
+    # a reused connection the second waits for the first to be acknowledged
+    # -- and the peer's delayed ACK does not arrive for 40ms.  That turns a
+    # 1.4ms call into a 44ms one.  Closing the connection hides it, which is
+    # why it only appears once connections are kept alive.
+    disable_nagle_algorithm = True
+
     # Filled in by the transport when it builds the server.
     transport = None
 
