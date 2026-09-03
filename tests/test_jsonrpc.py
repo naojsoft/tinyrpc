@@ -108,8 +108,8 @@ def test_parsing_invalid_arguments(prot):
 def test_good_reply_samples(prot, data, id, result):
     # assume the protocol is awaiting a response for
     # a request with `id`
-    prot._pending_replies = [id]
-    
+    prot.expect_reply(id)
+
     reply = prot.parse_reply(data)
 
     assert reply.unique_id == id
@@ -120,7 +120,7 @@ def test_good_reply_samples(prot, data, id, result):
     """{"jsonrpc": "2.0", "result": 19, "id": 9001}"""
 ])
 def test_unsolicited_reply_raises_error(prot, data):
-    prot._pending_replies = [4]
+    prot.expect_reply(4)
     with pytest.raises(InvalidReplyError):
         reply = prot.parse_reply(data)
 
@@ -590,3 +590,119 @@ def test_pass_error_data_with_custom_exception(prot):
     assert hasattr(parsed_reply, "data")
     assert serialized_reply == jmsg
     assert decoded_reply == decoded
+
+
+# ---------------------------------------------------------------------------
+# Tracking of ids whose replies have not arrived yet.
+#
+# The protocol remembers each outgoing request id so that it can reject a
+# reply answering nothing it sent.  Only a reply used to clear an entry, so
+# an id whose reply never came stayed remembered forever.
+# ---------------------------------------------------------------------------
+
+def test_expect_reply_then_claim(prot):
+    prot.expect_reply(7)
+    assert prot._pending_replies == {7: None}
+    assert prot._claim_reply(7) is True
+    assert prot._pending_replies == {}
+    assert prot._claim_reply(7) is False, "an id can only be claimed once"
+
+
+def test_forget_request_reports_whether_it_was_expected(prot):
+    prot.expect_reply(7)
+    assert prot.forget_request(7) is True
+    assert prot.forget_request(7) is False
+    assert prot._pending_replies == {}
+
+
+def test_a_request_that_is_never_answered_is_forgettable(prot):
+    """Regression: nothing cleared an id whose reply never arrived, so a
+    long-running client accumulated them without bound."""
+    req = prot.create_request('foo', [1], None)
+    assert prot._pending_replies == {req.unique_id: None}
+
+    prot.forget_request(req.unique_id)
+    assert prot._pending_replies == {}
+
+
+def test_one_way_requests_are_not_tracked(prot):
+    prot.create_request('foo', [1], None, one_way=True)
+    assert prot._pending_replies == {}
+
+
+def test_outstanding_ids_are_capped():
+    """The ceiling is the backstop for clients that never report a timeout,
+    and for connections that drop without telling anybody."""
+    from tinyrpc.protocols.jsonrpc import JSONRPCProtocol
+
+    prot = JSONRPCProtocol(max_pending_replies=4)
+    ids = [prot.create_request('foo', [n], None).unique_id
+           for n in range(10)]
+
+    assert len(prot._pending_replies) == 4
+    # The four most recent survive; the oldest were evicted.
+    assert list(prot._pending_replies) == ids[-4:]
+
+
+def test_the_cap_can_be_disabled():
+    from tinyrpc.protocols.jsonrpc import JSONRPCProtocol
+
+    prot = JSONRPCProtocol(max_pending_replies=None)
+    for n in range(50):
+        prot.create_request('foo', [n], None)
+    assert len(prot._pending_replies) == 50
+
+
+def test_a_reply_for_an_evicted_id_is_unsolicited():
+    from tinyrpc.protocols.jsonrpc import JSONRPCProtocol
+
+    prot = JSONRPCProtocol(max_pending_replies=2)
+    first = prot.create_request('foo', [1], None)
+    for n in range(3):
+        prot.create_request('foo', [n], None)
+
+    with pytest.raises(InvalidReplyError):
+        prot.parse_reply(
+            b'{"jsonrpc": "2.0", "result": 19, "id": %d}' % first.unique_id)
+
+
+def test_claim_reply_is_atomic_across_threads():
+    """Replies are parsed on a different thread from the one making calls, so
+    the test-and-remove has to happen as one step: exactly one claimer wins.
+    """
+    import threading
+    from tinyrpc.protocols.jsonrpc import JSONRPCProtocol
+
+    prot = JSONRPCProtocol(max_pending_replies=None)
+    n_ids = 500
+    ids = [prot.create_request('foo', [n], None).unique_id
+           for n in range(n_ids)]
+
+    wins = []
+    lock = threading.Lock()
+    start = threading.Barrier(4)
+
+    def claimer():
+        start.wait()
+        mine = [i for i in ids if prot._claim_reply(i)]
+        with lock:
+            wins.extend(mine)
+
+    threads = [threading.Thread(target=claimer) for _ in range(4)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+
+    assert sorted(wins) == sorted(ids), "every id claimed exactly once"
+    assert prot._pending_replies == {}
+
+
+def test_pending_replies_lookup_is_not_linear():
+    """It used to be a list, so both the membership test and the removal in
+    _parse_subreply were O(n) -- quadratic for a client with many calls in
+    flight.  A dict makes both O(1)."""
+    from tinyrpc.protocols.jsonrpc import JSONRPCProtocol
+
+    prot = JSONRPCProtocol(max_pending_replies=None)
+    assert isinstance(prot._pending_replies, dict)

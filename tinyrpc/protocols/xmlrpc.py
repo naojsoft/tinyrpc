@@ -118,8 +118,8 @@ class XMLRPCInvalidRequestError(FixedErrorMessageMixin, InvalidRequestError):
 
 class XMLRPCMethodNotFoundError(FixedErrorMessageMixin, MethodNotFoundError):
     """The requested method name is not found in the registry."""
-    xmlrpc_error_code = 1
-    message = "Method is not supported"
+    xmlrpc_error_code = -32601
+    message = "Method not found"
 
 
 class XMLRPCInvalidParamsError(FixedErrorMessageMixin, InvalidRequestError):
@@ -136,7 +136,7 @@ class XMLRPCInternalError(FixedErrorMessageMixin, InvalidRequestError):
 
 class XMLRPCServerError(FixedErrorMessageMixin, InvalidRequestError):
     """Unspecified error, this message originates from the called function."""
-    xmlrpc_error_code = -32000
+    xmlrpc_error_code = -32500
     message = ''
 
 
@@ -436,8 +436,35 @@ class XMLRPCRequest(RPCRequest):
                                    allow_none=self.allow_none).encode()
 
 
+
+# TODO: XML-RPC batch (system.multicall) support is DISABLED because the
+# implementation below is broken in three independent ways.  To re-enable it,
+# all three must be fixed and covered by round-trip tests:
+#
+#   1. XMLRPCBatchRequest.serialize() emits a list of bare argument arrays,
+#      but parse_request() expects the conventional multicall format, a list
+#      of {'methodName': ..., 'params': [...]} structs (see MultiCallIterator
+#      in the stdlib xmlrpc.client).  parse_request() is the correct one;
+#      serialize() must be brought in line with it.
+#   2. XMLRPCBatchResponse.serialize() passes BOTH methodname= and
+#      methodresponse= to xmlrpc.client.dumps().  methodname wins, so the
+#      batch *response* is emitted as a <methodCall> instead of a
+#      <methodResponse>.  Drop the methodname argument.
+#   3. parse_reply() hardcodes `batch_request = False`, so a batch reply is
+#      never parsed as a batch.  XML-RPC puts no id on the wire and the stdlib
+#      server returns None for the method name, so the protocol cannot tell a
+#      multicall reply from an ordinary one by inspection alone; the client
+#      must carry that expectation across the call.
+#
+# Note that the stdlib SimpleXMLRPCServer only answers system.multicall when
+# register_multicall_functions() has been called, so rejecting it here matches
+# the default behaviour of an ordinary Python XML-RPC server.
+
 class XMLRPCBatchRequest(RPCBatchRequest):
-    """Defines a XML RPC batch request."""
+    """Defines a XML RPC batch request.
+
+    .. warning:: Disabled.  See the TODO note above this class.
+    """
     def create_batch_response(self) -> Optional['XMLRPCBatchResponse']:
         """Produces a batch response object if a response is expected.
 
@@ -511,6 +538,10 @@ class XMLRPCProtocol(RPCBatchProtocol):
 
     XML_RPC_VERSION = "1.0"
 
+    # XML-RPC puts no id on the wire, so parse_reply() cannot say which
+    # request a reply answers.  See RPCProtocol.supports_reply_correlation.
+    supports_reply_correlation = False
+
     def __init__(
             self,
             id_generator: Optional[Generator[object, None, None]] = None,
@@ -553,8 +584,13 @@ class XMLRPCProtocol(RPCBatchProtocol):
         :type requests: :py:class:`list` or :py:class:`XMLRPCRequest`
         :return: A new request instance.
         :rtype: :py:class:`XMLRPCBatchRequest`
+        :raises NotImplementedError: batch support is disabled; see the note
+            above :py:class:`XMLRPCBatchRequest`.
         """
-        return XMLRPCBatchRequest(requests or [])
+        raise NotImplementedError(
+            "XML-RPC batch (system.multicall) support is disabled in this "
+            "implementation; see the TODO above XMLRPCBatchRequest."
+        )
 
     def create_request(
             self,
@@ -700,6 +736,11 @@ class XMLRPCProtocol(RPCBatchProtocol):
             kwargs = {}
             return self._make_request(method_name, args, kwargs)
 
+        # Batch support is disabled -- see the TODO above XMLRPCBatchRequest.
+        # Report it the way a server without register_multicall_functions()
+        # would: the method simply is not there.
+        raise XMLRPCMethodNotFoundError(request_id=None)
+
         # <-- batch call (XMLRPC multicall)
         # req looks like:
         # (([{'methodName': 'add', 'params': [7, 3]},
@@ -775,7 +816,8 @@ class XMLRPCProtocol(RPCBatchProtocol):
             ``data`` property.
         """
         #exc = XMLRPCError(error)
-        exc = xmlrpc.client.Fault(error.error, error._xmlrpc_error_code)
+        # xmlrpc.client.Fault takes (faultCode, faultString) in that order.
+        exc = xmlrpc.client.Fault(error._xmlrpc_error_code, error.error)
         if self.raises_errors:
             raise exc
         return exc

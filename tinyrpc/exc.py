@@ -1,5 +1,6 @@
 #!/usr/bin/env python
 # -*- coding: utf-8 -*-
+import builtins
 from abc import ABC
 
 
@@ -49,5 +50,11 @@ class InvalidParamsError(RPCError, ABC):
 class ServerError(RPCError, ABC):
     """An internal error in the RPC system occurred."""
 
-class TimeoutError(Exception):
-    """No reply received within the timeout period."""
+class TimeoutError(builtins.TimeoutError):
+    """No reply received within the timeout period.
+
+    This derives from the builtin :py:exc:`TimeoutError` so that code which
+    catches either one catches both.  Transports differ in which they raise
+    -- the TCP transports raise the builtin, the 0mq transport raises this
+    one -- and a caller should not have to know which.
+    """

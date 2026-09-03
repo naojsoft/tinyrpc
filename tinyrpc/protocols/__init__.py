@@ -223,6 +223,20 @@ class RPCBatchResponse(list):
 
 
 class RPCProtocol(ABC):
+    #: Whether a reply parsed by :py:meth:`parse_reply` carries the
+    #: ``unique_id`` of the request it answers.
+    #:
+    #: Protocols that assign an id and have the server echo it back (JSON-RPC,
+    #: msgpack-RPC) can have several requests outstanding on one transport at
+    #: once, because each reply says which request it belongs to.  XML-RPC
+    #: does not: it has no id field, and a reply is matched to its request by
+    #: connection and ordering alone, so only one call can be in flight per
+    #: connection.
+    #:
+    #: :py:class:`~tinyrpc.client_multiplexing.MultiplexingRPCClient` refuses
+    #: a protocol that sets this to ``False``.
+    supports_reply_correlation = True
+
     """Abstract base class for all protocol implementations."""
 
     supports_out_of_order = False

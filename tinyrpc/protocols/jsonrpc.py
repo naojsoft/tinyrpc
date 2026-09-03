@@ -11,7 +11,9 @@ Tinyrpc will detect the presence of jsonext and use it automatically.
 """
 
 import json
+import logging
 import sys
+import threading
 from tinyrpc.exc import UnexpectedIDError
 from typing import Dict, Any, Union, Optional, List, Tuple, Callable, Generator
 
@@ -498,6 +500,17 @@ class JSONRPCBatchResponse(RPCBatchResponse):
         ]).encode()
 
 
+logger = logging.getLogger(__name__)
+
+#: Default ceiling on how many request ids a protocol instance will remember
+#: while waiting for their replies.  See
+#: :py:attr:`JSONRPCProtocol.max_pending_replies`.
+DEFAULT_MAX_PENDING_REPLIES = 1024
+
+#: Sentinel distinguishing "absent" from a legitimately stored ``None``.
+_MISSING = object()
+
+
 class JSONRPCProtocol(RPCBatchProtocol):
     """JSONRPC protocol implementation."""
 
@@ -511,14 +524,92 @@ class JSONRPCProtocol(RPCBatchProtocol):
             self,
             id_generator: Optional[Generator[object, None, None]] = None,
             *args,
+            max_pending_replies: Optional[int] = DEFAULT_MAX_PENDING_REPLIES,
             **kwargs
     ) -> None:
+        """
+        :param id_generator: Yields the ids given to outgoing requests.  Note
+            that it may be advanced from several threads at once, so a plain
+            Python generator is not safe here; the default,
+            :py:func:`itertools.count`, is.
+        :param max_pending_replies: Ceiling on remembered request ids, or
+            ``None`` for no ceiling.  See :py:attr:`max_pending_replies`.
+        """
         super(JSONRPCProtocol, self).__init__(*args, **kwargs)
         self._id_generator = id_generator or default_id_generator()
-        self._pending_replies = []
+
+        #: Ids of requests whose replies have not arrived yet, used to reject
+        #: a reply that answers nothing we sent.  A dict rather than a list so
+        #: that the membership test and removal in :py:meth:`_parse_subreply`
+        #: are O(1) -- a client with many calls in flight would otherwise be
+        #: quadratic -- and ordered (guaranteed since Python 3.7) so that the
+        #: oldest entry can be identified for eviction.  The values are
+        #: unused; only the keys matter.
+        self._pending_replies = {}
+        self._pending_lock = threading.Lock()
+
+        #: A reply that never arrives would otherwise leave its id here
+        #: forever: nothing tells the protocol that a call timed out or that
+        #: a connection dropped.  A client that knows should say so by
+        #: calling :py:meth:`forget_request`, but not every client does (and
+        #: a dropped connection tells nobody), so past this many outstanding
+        #: ids the oldest is evicted to keep the set bounded.  Set it to
+        #: ``None`` to disable the ceiling and accept unbounded growth.
+        self.max_pending_replies = max_pending_replies
 
     def _get_unique_id(self) -> object:
         return next(self._id_generator)
+
+    def expect_reply(self, unique_id: object) -> None:
+        """Note that a reply carrying ``unique_id`` should be accepted.
+
+        Called for every request that is not one-way.  If this pushes the
+        number of outstanding ids past :py:attr:`max_pending_replies`, the
+        oldest is dropped; a reply for it would then be rejected as
+        unsolicited, so the ceiling is a backstop against unbounded growth
+        rather than a limit to run into in normal use.
+        """
+        with self._pending_lock:
+            self._pending_replies[unique_id] = None
+
+            if self.max_pending_replies is None:
+                return
+
+            while len(self._pending_replies) > self.max_pending_replies:
+                evicted = next(iter(self._pending_replies))
+                del self._pending_replies[evicted]
+                logger.warning(
+                    "more than %d replies outstanding; forgetting request "
+                    "%r, whose reply will now be rejected as unsolicited. "
+                    "Call forget_request() when a call is abandoned, or "
+                    "raise max_pending_replies.",
+                    self.max_pending_replies, evicted)
+
+    def forget_request(self, unique_id: object) -> bool:
+        """Stop expecting a reply to ``unique_id``.
+
+        Call this when a request will never be answered -- it timed out, or
+        the connection carrying it dropped -- so that its id does not sit in
+        :py:attr:`_pending_replies` forever.
+
+        :return: Whether the id was still being expected.
+        """
+        with self._pending_lock:
+            return self._pending_replies.pop(unique_id,
+                                             _MISSING) is not _MISSING
+
+    def _claim_reply(self, unique_id: object) -> bool:
+        """Test-and-remove ``unique_id``, as one atomic step.
+
+        Doing it in one step under the lock matters: replies may be parsed on
+        a different thread from the one creating requests.
+
+        :return: Whether the id was being expected, i.e. whether the reply
+            was solicited.
+        """
+        with self._pending_lock:
+            return self._pending_replies.pop(unique_id,
+                                             _MISSING) is not _MISSING
 
     def request_factory(self) -> 'JSONRPCRequest':
         """Factory for request objects.
@@ -575,7 +666,7 @@ class JSONRPCProtocol(RPCBatchProtocol):
 
         if not one_way:
             request.unique_id = self._get_unique_id()
-            self._pending_replies.append(request.unique_id)
+            self.expect_reply(request.unique_id)
 
         request.method = method
         if args is not None:
@@ -655,12 +746,10 @@ class JSONRPCProtocol(RPCBatchProtocol):
             response.result = rep.get('result', None)
 
         response.unique_id = rep['id']
-        if response.unique_id not in self._pending_replies:
+        if not self._claim_reply(response.unique_id):
             raise UnexpectedIDError(
                 'Reply id does not correspond to any sent requests.'
             )
-        else:
-            self._pending_replies.remove(response.unique_id)
 
         return response
 
