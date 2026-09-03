@@ -13,81 +13,196 @@ import time
 import asyncio
 
 from . import (ServerTransport, ClientTransport,
-               NonBlockingClientTransport)
+               NonBlockingClientTransport, TransportTimeout)
 
 max_pkt_size = 4096
 
 
 class ConnectionlessTcpClientTransport(ClientTransport):
+    """A TCP client that dials afresh for every call.
+
+    Nothing is held between calls, so there is no connection to go stale and
+    nothing to reconnect: a client and a service can be restarted in any
+    order.  That is the same bargain
+    :py:class:`~tinyrpc.transports.http.HttpPostClientTransport` makes, which
+    also opens a connection per request.
+
+    :param packer: Framing.  The default is length-prefixed
+        (:py:class:`TransportPackerRobust`); the server must use the same.
+    """
 
     def __init__(self, endpoint: tuple[str, int],
                  packer: Any = None,
+                 timeout: Any = None,
                  **kwargs) -> None:
         self.endpoint = endpoint
+        self.timeout = timeout
         if packer is None:
-            packer = TransportPacker()
+            packer = TransportPackerRobust()
         self.packer = packer
 
-    def send_message(self, message: bytes, expect_reply: bool =True) -> bytes:
+    def send_message(self, message: bytes, expect_reply: bool = True,
+                     timeout: Any = None) -> bytes:
+        if timeout is None:
+            timeout = self.timeout
 
         with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+            if timeout is not None:
+                sock.settimeout(timeout)
             sock.connect(self.endpoint)
 
             self.packer.send(sock, message)
             if expect_reply:
-                try:
-                    recv_data = self.packer.recv(sock)
-                except ConnectionError as e:
-                    recv_data = b''
-                return recv_data
+                return self.packer.recv(sock)
 
 
 class ConnectionlessTcpServerTransport(ServerTransport):
-    """Server transport based on a :py:const:`socket` socket.
+    """Server transport for clients that dial once per call.
 
-    :param socket: A :py:const:`socket` socket instance, bound to an
-                   endpoint.
+    Accepting and reading happen on threads of their own, and completed
+    messages are handed to the server loop through a queue.  Doing the read
+    in :py:meth:`receive_message` instead -- as this used to -- serialises
+    it with everything else the server is doing, so one slow client stalls
+    every other.
+
+    :param sock: A listening socket.
+    :param packer: Framing.  The default is length-prefixed
+        (:py:class:`TransportPackerRobust`), which the previous default was
+        not: it read a single 4096-byte chunk, so a larger message arrived
+        truncated and two smaller ones could arrive as one.
+    :param poll_timeout: How long :py:meth:`receive_message` waits before
+        raising :py:exc:`TransportTimeout`, which lets a server loop notice
+        it has been asked to stop.
+    :param read_timeout: How long a client has to finish sending, after
+        which its connection is dropped.
     """
 
     def __init__(self, sock: Any,
                  packer: Any = None,
+                 poll_timeout: float = 0.5,
+                 read_timeout: float = 30.0,
+                 logger: Any = None,
                  ) -> None:
         self.sock = sock
         if packer is None:
-            packer = TransportPacker()
+            packer = TransportPackerRobust()
         self.packer = packer
+        self.poll_timeout = poll_timeout
+        self.read_timeout = read_timeout
+        self.logger = logger
+
+        self.messages = queue.Queue()
+        self._ev_quit = threading.Event()
+        self._thread = None
+        # As for the HTTP transport: start() and stop() may be called from
+        # more than one place, so both must tolerate it.
+        self._lifecycle = threading.Lock()
+
+    @property
+    def endpoint(self) -> tuple:
+        """The address actually bound, which is what to register with a name
+        service when the port was chosen by the OS."""
+        return self.sock.getsockname()[:2]
+
+    def start(self) -> None:
+        """Begin accepting connections, on a thread of its own."""
+        with self._lifecycle:
+            if self._thread is not None:
+                return
+            self._thread = threading.Thread(target=self._accept_forever,
+                                            name='tcp-transport')
+            self._thread.daemon = True
+            self._thread.start()
+
+    def stop(self) -> None:
+        """Stop accepting and release the listening socket."""
+        self._ev_quit.set()
+        try:
+            self.sock.close()
+        except Exception:
+            pass
+
+        with self._lifecycle:
+            thread, self._thread = self._thread, None
+        if thread is not None:
+            thread.join(timeout=5.0)
+
+    def _log(self, message):
+        if self.logger is not None:
+            self.logger.debug(message)
+
+    def _accept_forever(self):
+        self.sock.settimeout(0.5)
+        while not self._ev_quit.is_set():
+            try:
+                conn, addr = self.sock.accept()
+            except socket.timeout:
+                continue
+            except OSError:
+                # The listening socket was closed, most likely by stop().
+                break
+
+            reader = threading.Thread(target=self._read_one, args=(conn, addr))
+            reader.daemon = True
+            reader.start()
+
+    def _read_one(self, conn, addr):
+        """Read one message off a freshly accepted connection.
+
+        Runs on its own thread, so a client that connects and then says
+        nothing costs one thread until it times out rather than blocking the
+        service.  Failures are dropped: a connection nobody can read from is
+        not the server's problem to raise about.
+        """
+        try:
+            conn.settimeout(self.read_timeout)
+            message = self.packer.recv(conn)
+        except Exception as e:
+            self._log("dropping connection from %s: %s" % (addr, e))
+            try:
+                conn.close()
+            except Exception:
+                pass
+            return
+
+        context = SimpleNamespace(sock=conn, client_address=addr,
+                                  # No credential channel: unlike HTTP there
+                                  # is no header to carry one.
+                                  auth=None)
+        self.messages.put((context, message))
 
     def receive_message(self) -> Tuple[Any, bytes]:
-        sock, addr = self.sock.accept()
+        """Return the next ``(context, message)`` pair.
+
+        :raises TransportTimeout: when nothing arrived within
+            ``poll_timeout``.  Not an error: it lets a server loop test its
+            termination flag between requests.
+        """
         try:
-            msg = self.packer.recv(sock)
-        except ConnectionError as e:
-            msg = b''
-        if len(msg) == 0:
-            raise ValueError("socket error: no data received")
+            return self.messages.get(timeout=self.poll_timeout)
+        except queue.Empty:
+            raise TransportTimeout()
 
-        return sock, msg
-
-    def send_reply(self, sock: Any, reply: bytes) -> None:
-        with sock:
-            self.packer.send(sock, reply)
+    def send_reply(self, context: Any, reply: bytes) -> None:
+        with context.sock:
+            self.packer.send(context.sock, reply)
 
     @classmethod
-    def create(cls, endpoint: tuple[str, int], backlog: int = 0,
-               packer: Any = None) -> 'ConnectionlessTcpServerTransport':
-        """Create new server transport.
+    def create(cls, endpoint: tuple[str, int], backlog: int = 64,
+               packer: Any = None, **kwargs
+               ) -> 'ConnectionlessTcpServerTransport':
+        """Create and bind a new server transport.
 
-        Instead of creating the socket yourself, you can call this function
-        with the (host, port) endpoint.
-
-        :param endpoint: The endpoint clients will connect to.
-        :param backlog: The number of pending connections to allow.
+        :param endpoint: The endpoint clients will connect to.  Use port 0 to
+            let the OS choose, then read :py:attr:`endpoint` back.
+        :param backlog: Pending connections to allow.  The former default of
+            0 leaves almost no room for a burst.
         """
         sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         sock.bind(endpoint)
         sock.listen(backlog)
-        return cls(sock, packer=packer)
+        return cls(sock, packer=packer, **kwargs)
 
 
 class TcpClientTransport(ClientTransport):
