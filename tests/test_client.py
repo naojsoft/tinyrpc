@@ -175,3 +175,57 @@ def test_client_send_binary_message(
     client.call(method_name, method_args, method_kwargs, one_way_setting)
     assert mock_transport.send_message.called
     assert isinstance(mock_transport.send_message.call_args[0][0], bytes)
+
+
+def test_plain_client_forgets_a_request_whose_send_failed():
+    """Regression: a failed send left the request id in the protocol's
+    pending set forever, because only a parsed reply cleared it.  This is the
+    ordinary RPCClient, not just the multiplexing one -- it leaked too.
+    """
+    from tinyrpc.client import RPCClient
+    from tinyrpc.protocols.jsonrpc import JSONRPCProtocol
+
+    class FailingTransport:
+        def send_message(self, message, expect_reply=True, **kwargs):
+            raise ConnectionError('link down')
+
+    protocol = JSONRPCProtocol()
+    client = RPCClient(protocol, FailingTransport())
+
+    for _ in range(5):
+        with pytest.raises(ConnectionError):
+            client.call('add', [1, 2], None)
+
+    assert protocol._pending_replies == {}
+
+
+def test_plain_client_forgets_a_request_whose_reply_was_unparseable():
+    from tinyrpc.client import RPCClient
+    from tinyrpc.protocols.jsonrpc import JSONRPCProtocol
+
+    class GarbageTransport:
+        def send_message(self, message, expect_reply=True, **kwargs):
+            return b'not a reply at all'
+
+    protocol = JSONRPCProtocol()
+    client = RPCClient(protocol, GarbageTransport())
+
+    with pytest.raises(Exception):
+        client.call('add', [1, 2], None)
+
+    assert protocol._pending_replies == {}
+
+
+def test_plain_client_clears_the_id_on_a_normal_call():
+    from tinyrpc.client import RPCClient
+    from tinyrpc.protocols.jsonrpc import JSONRPCProtocol
+
+    protocol = JSONRPCProtocol()
+
+    class EchoTransport:
+        def send_message(self, message, expect_reply=True, **kwargs):
+            return protocol.parse_request(message).respond(3).serialize()
+
+    client = RPCClient(protocol, EchoTransport())
+    assert client.call('add', [1, 2], None) == 3
+    assert protocol._pending_replies == {}

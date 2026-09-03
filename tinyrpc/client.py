@@ -58,14 +58,21 @@ class RPCClient(object):
             kwargs['timeout'] = timeout
 
         # sends ...
-        reply = tport.send_message(req.serialize(), **kwargs)
+        try:
+            reply = tport.send_message(req.serialize(), **kwargs)
 
-        if one_way:
-            # ... and be done
-            return
+            if one_way:
+                # ... and be done
+                return
 
-        # ... or process the reply
-        response = self.protocol.parse_reply(reply)
+            # ... or process the reply
+            response = self.protocol.parse_reply(reply)
+        except Exception:
+            # The reply is not coming, or was unusable.  A protocol that
+            # remembers which ids it is expecting replies for would otherwise
+            # remember this one forever, since only a parsed reply clears it.
+            self._forget_request(req)
+            raise
 
         if not no_exception and isinstance(response, RPCErrorResponse):
             if hasattr(self.protocol, 'raise_error') and callable(
@@ -77,6 +84,18 @@ class RPCClient(object):
                 )
 
         return response
+
+    def _forget_request(self, req: RPCRequest) -> None:
+        """Tell the protocol to stop expecting a reply to ``req``.
+
+        A no-op for protocols that keep no such record.
+        """
+        unique_id = getattr(req, 'unique_id', None)
+        if unique_id is None:
+            return
+        forget = getattr(self.protocol, 'forget_request', None)
+        if callable(forget):
+            forget(unique_id)
 
     def call(
             self, method: str, args: List, kwargs: Dict,
