@@ -196,6 +196,10 @@ class HttpServerTransport(ServerTransport):
                                                         server_side=True)
 
         self._thread = None
+        # start() and stop() are called from more than one place -- a server
+        # loop's shutdown path and its owner's -- so both must be safe to
+        # call twice and at once.
+        self._lifecycle = threading.Lock()
 
     @property
     def endpoint(self) -> Tuple[str, int]:
@@ -205,20 +209,31 @@ class HttpServerTransport(ServerTransport):
 
     def start(self) -> None:
         """Begin accepting connections, in a thread of its own."""
-        if self._thread is not None:
-            return
-        self._thread = threading.Thread(target=self.httpd.serve_forever,
-                                        name='http-transport')
-        self._thread.daemon = True
-        self._thread.start()
+        with self._lifecycle:
+            if self._thread is not None:
+                return
+            self._thread = threading.Thread(target=self.httpd.serve_forever,
+                                            name='http-transport')
+            self._thread.daemon = True
+            self._thread.start()
 
     def stop(self) -> None:
-        """Stop accepting connections and release the listening socket."""
-        self.httpd.shutdown()
-        self.httpd.server_close()
-        if self._thread is not None:
-            self._thread.join(timeout=5.0)
-            self._thread = None
+        """Stop accepting connections and release the listening socket.
+
+        Safe to call whether or not :py:meth:`start` was.  ``shutdown()``
+        waits for the serve loop to acknowledge, so calling it when that loop
+        was never started waits for an acknowledgement that cannot come.
+        """
+        with self._lifecycle:
+            thread, self._thread = self._thread, None
+
+        if thread is not None:
+            self.httpd.shutdown()
+            thread.join(timeout=5.0)
+        try:
+            self.httpd.server_close()
+        except Exception:
+            pass
 
     def receive_message(self) -> Tuple[Any, bytes]:
         """Return the next ``(context, message)`` pair.
