@@ -3,10 +3,7 @@
 
 from typing import Tuple, Any
 from types import SimpleNamespace
-from collections import deque
-import contextlib
 import socket
-import selectors
 import threading
 import queue
 import time
@@ -236,282 +233,339 @@ class TcpClientTransport(ClientTransport):
 
 
 class TcpServerTransport(ServerTransport):
-    """Server transport based on a :py:const:`socket` socket.
+    """Server transport that keeps each client's connection open.
 
-    :param socket: A :py:const:`socket` socket instance, bound to an
-                   endpoint.
+    The counterpart to :py:class:`NonBlockingTcpClientTransport`: a client
+    connects once and sends many requests, which is what multiplexing needs.
+    Contrast :py:class:`ConnectionlessTcpServerTransport`, which answers one
+    request per connection and hangs up.
+
+    Each connection gets a reader thread, and completed messages reach the
+    server loop through a queue.  Replies are written straight back on the
+    connection they came from, under a per-connection lock, so a reply does
+    not have to wait for the server loop to come round again -- and two
+    workers replying to the same client cannot interleave their bytes.
+
+    :param sock: A listening socket.
+    :param packer: Framing.  The default is length-prefixed
+        (:py:class:`TransportPackerRobust`).  Framing is not optional here:
+        with several requests in flight on one connection there is nothing
+        else to say where one ends and the next begins.
+    :param poll_timeout: How long :py:meth:`receive_message` waits before
+        raising :py:exc:`TransportTimeout`, which lets a server loop notice
+        it has been asked to stop.
     """
 
     def __init__(self,
                  sock: Any,
                  packer: Any = None,
-                 timeout: float = 1.0) -> None:
+                 poll_timeout: float = 0.5,
+                 logger: Any = None) -> None:
         self.sock = sock
-        self.sock.setblocking(False)
-        self.timeout = timeout
-        self.sel = selectors.DefaultSelector()
-        self.sel.register(self.sock, selectors.EVENT_READ, data=None)
-        self.incoming = deque()
-        self.lock = threading.RLock()
         if packer is None:
-            packer = TransportPacker()
+            packer = TransportPackerRobust()
         self.packer = packer
+        self.poll_timeout = poll_timeout
+        self.logger = logger
 
-    def _accept_connection(self):
-        """This method is called when a client attempts to connect
-        on our listening socket.
-        """
+        self.messages = queue.Queue()
+        self._ev_quit = threading.Event()
+        self._thread = None
+        self._lifecycle = threading.Lock()
+
+    @property
+    def endpoint(self) -> tuple:
+        return self.sock.getsockname()[:2]
+
+    def _log(self, message):
+        if self.logger is not None:
+            self.logger.debug(message)
+
+    def start(self) -> None:
+        with self._lifecycle:
+            if self._thread is not None:
+                return
+            self._thread = threading.Thread(target=self._accept_forever,
+                                            name='tcp-server')
+            self._thread.daemon = True
+            self._thread.start()
+
+    def stop(self) -> None:
+        self._ev_quit.set()
         try:
-            conn_sock, addr = self.sock.accept()
-        except socket.error as e:
-            # TODO: troubleshooting here? Re-establish listening socket?
-            return
-        #conn_sock.setblocking(False)
-        # create a Transport context to be passed around as needed
-        ctx = SimpleNamespace(sock=conn_sock, addr=addr,
-                              inbox=deque(), outbox=deque(),
-                              packer=self.packer)
-        # we are interested in read/write events on the socket
-        events = selectors.EVENT_READ | selectors.EVENT_WRITE
-        self.sel.register(conn_sock, events, data=ctx)
+            self.sock.close()
+        except Exception:
+            pass
+        with self._lifecycle:
+            thread, self._thread = self._thread, None
+        if thread is not None:
+            thread.join(timeout=5.0)
 
-    def _service_read(self, sock, ctx):
-        """This method is called when activity happens on a client-
-        connected socket.
-        """
-        # service incoming
+    def _accept_forever(self):
+        self.sock.settimeout(0.5)
+        while not self._ev_quit.is_set():
+            try:
+                conn, addr = self.sock.accept()
+            except socket.timeout:
+                continue
+            except OSError:
+                break
+
+            conn.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+            reader = threading.Thread(target=self._serve_connection,
+                                      args=(conn, addr))
+            reader.daemon = True
+            reader.start()
+
+    def _serve_connection(self, conn, addr):
+        """Read requests off one connection for as long as it lasts."""
+        context = SimpleNamespace(sock=conn, client_address=addr,
+                                  send_lock=threading.Lock(),
+                                  # A bare socket carries no credentials.
+                                  auth=None)
         try:
-            recv_data = ctx.packer.recv(sock)
-        except ConnectionError as e:
-            recv_data = b''
-        if len(recv_data) > 0:
-            ctx.inbox.append(recv_data)
-            self.incoming.append(ctx)
-        else:
-            # socket appears to be closed at other end
-            try:
-                self.sel.unregister(sock)
-            except (KeyError, ValueError):
-                # raises KeyError if socket is not registered
-                pass
-            #ctx.sock = None
-            try:
-                sock.close()
-            except Exception:
-                pass
-
-    def _service_write(self, sock, ctx):
-        # service outgoing
-        buf = ctx.outbox.popleft()
-        try:
-            ctx.packer.send(sock, buf)
-        except ConnectionError as e:
-            # socket appears to be closed at other end
-            # try to reconnect and send on another socket
-            ctx.outbox.appendleft(buf)
-            try:
-                self.sel.unregister(sock)
-            except (KeyError, ValueError):
-                # raises KeyError if socket is not registered
-                pass
-            #ctx.sock = None
-            try:
-                sock.close()
-            except Exception:
-                pass
-
-    def _process_events(self):
-        try:
-            with self.lock:
-                events = self.sel.select(timeout=self.timeout)
-                out_events = []
-                # process all reads
-                for key, mask in events:
-                    if key.data is None:
-                        # event on our listening socket
-                        self._accept_connection()
-                    else:
-                        # event on an accepted socket
-                        if mask & selectors.EVENT_READ:
-                            sock, ctx = key.fileobj, key.data
-                            self._service_read(sock, ctx)
-                        if mask & selectors.EVENT_WRITE:
-                            out_events.append(key)
-
-                # process all pending writes
-                for key in out_events:
-                    sock, ctx = key.fileobj, key.data
-                    if len(ctx.outbox) > 0:
-                        self._service_write(sock, ctx)
-
+            while not self._ev_quit.is_set():
+                message = self.packer.recv(conn)
+                if not message:
+                    break
+                self.messages.put((context, message))
         except Exception as e:
-            print(f"error processing events {e}")
+            self._log('connection from %s ended: %s' % (addr, e))
+        finally:
+            try:
+                conn.close()
+            except Exception:
+                pass
 
     def receive_message(self) -> Tuple[SimpleNamespace, bytes]:
-        with self.lock:
-            while len(self.incoming) == 0:
-                self._process_events()
+        """Return the next ``(context, message)`` pair.
 
-            ctx = self.incoming.popleft()
-            msg = ctx.inbox.popleft()
-        return ctx, msg
+        :raises TransportTimeout: when nothing arrived within
+            ``poll_timeout``.
+        """
+        try:
+            return self.messages.get(timeout=self.poll_timeout)
+        except queue.Empty:
+            raise TransportTimeout()
 
     def send_reply(self, ctx: SimpleNamespace, reply: bytes) -> None:
-        ctx.outbox.append(reply)
+        """Write a reply back on the connection it came from.
+
+        The connection stays open: this client will send more.  A failure
+        here means the client has gone, which is its business rather than
+        ours, so it is logged rather than raised into the server loop.
+        """
+        try:
+            with ctx.send_lock:
+                self.packer.send(ctx.sock, reply)
+        except Exception as e:
+            self._log('could not reply to %s: %s' % (ctx.client_address, e))
 
     @classmethod
-    def create(cls, endpoint: tuple[str, int], backlog: int = 0,
-               packer: Any = None) -> 'TcpServerTransport':
-        """Create new server transport.
+    def create(cls, endpoint: tuple[str, int], backlog: int = 64,
+               packer: Any = None, **kwargs) -> 'TcpServerTransport':
+        """Create and bind a new server transport.
 
-        Instead of creating the socket yourself, you can call this function
-        with the (host, port) endpoint.
-
-        :param endpoint: The endpoint clients will connect to.
-        :param backlog: The number of pending connections to allow.
+        :param endpoint: The endpoint clients will connect to.  Use port 0 to
+            let the OS choose, then read :py:attr:`endpoint` back.
+        :param backlog: Pending connections to allow.
         """
         sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         sock.bind(endpoint)
         sock.listen(backlog)
-        return cls(sock, packer=packer)
+        return cls(sock, packer=packer, **kwargs)
 
 
 class NonBlockingTcpClientTransport(NonBlockingClientTransport):
     """A TCP client transport that can send without waiting for the reply.
 
-    Holds one connection open for the life of the transport and multiplexes
-    requests over it, so it pairs with
-    :py:class:`~tinyrpc.client_multiplexing.MultiplexingRPCClient` and a
-    protocol that carries a correlation id.
+    Holds one connection open and multiplexes requests over it, so it pairs
+    with :py:class:`~tinyrpc.client_multiplexing.MultiplexingRPCClient` and a
+    protocol that carries a correlation id.  A reader thread owns the
+    receiving end and puts whole messages on a queue; senders write under a
+    lock.  Nothing else touches the socket, which is what makes it safe to
+    use from several threads at once.
 
-    TODO: there is no reconnection.  The socket is opened once in __init__;
-    if it drops, ``_service_write`` puts the pending buffer back and
-    unregisters the socket, but nothing ever dials again, so the transport
-    stays dead.  A connect-per-call transport gets recovery for free and this
-    one does not, which matters wherever a service may be restarted
-    underneath a long-lived client.  Fixing it means deciding on a retry
-    policy (backoff, bounded attempts) and what to do with calls that were
-    already in flight when the link went down.
+    Unlike a transport that dials per call, this one holds a connection that
+    can die -- so it dials again.  Connecting is lazy and repeated: the first
+    send opens the connection, and a send after a drop opens a new one, so a
+    client and a service can still be started in either order and a service
+    can be restarted underneath a client that outlives it.
+
+    What cannot be recovered is a call that was already in flight when the
+    connection went: its reply is gone.  Those surface as timeouts at the
+    layer above, which is where the decision to retry belongs -- retrying
+    here would silently repeat calls that are not necessarily idempotent.
+
+    :param endpoint: ``(host, port)`` to connect to.
+    :param packer: Framing.  The default is length-prefixed
+        (:py:class:`TransportPackerRobust`).  Framing is not optional here:
+        without a length prefix there is no way to tell where one reply ends
+        and the next begins, and multiplexing depends on that.
+    :param connect_timeout: Seconds to allow for establishing a connection.
+    :param reconnect_interval: The shortest gap between connection attempts,
+        so that a service that is down is not hammered.
     """
 
     def __init__(self,
                  endpoint: tuple[str, int],
-                 packer: Any = None) -> None:
+                 packer: Any = None,
+                 connect_timeout: float = 10.0,
+                 reconnect_interval: float = 0.5,
+                 logger: Any = None) -> None:
         self.endpoint = endpoint
-        self.lock = threading.RLock()
-        self.sel = selectors.DefaultSelector()
-        self.incoming = queue.Queue()
-        self.outgoing = deque()
+        self.connect_timeout = connect_timeout
+        self.reconnect_interval = reconnect_interval
+        self.logger = logger
         if packer is None:
-            packer = TransportPacker()
+            packer = TransportPackerRobust()
         self.packer = packer
-        self._process_timeout = 0.0001
 
-        self.connect()
+        self.incoming = queue.Queue()
+        self._lock = threading.RLock()
+        self._sock = None
+        self._reader = None
+        self._generation = 0
+        self._last_attempt = 0.0
+        self._closed = False
 
-    def connect(self):
-        conn_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        conn_sock.connect(self.endpoint)
-        # create a Transport context to be passed around as needed
-        ctx = SimpleNamespace(sock=conn_sock,
-                              packer=self.packer)
-        # we are interested in read/write events on the socket
-        events = selectors.EVENT_READ | selectors.EVENT_WRITE
-        self.sel.register(conn_sock, events, data=ctx)
+    def _log(self, message):
+        if self.logger is not None:
+            self.logger.debug(message)
 
-    def _service_read(self, sock, ctx):
-        """This method is called when activity happens on a client-
-        connected socket.
+    @property
+    def connected(self) -> bool:
+        with self._lock:
+            return self._sock is not None
+
+    def connect(self) -> None:
+        """Establish the connection now, rather than on the first send."""
+        self._ensure_connection()
+
+    def _ensure_connection(self):
+        """Return a live socket, dialling if there is not one.
+
+        :raises ConnectionError: if a connection cannot be established.
         """
-        # service incoming
-        try:
-            recv_data = ctx.packer.recv(sock)
-        except ConnectionError as e:
-            recv_data = b''
-        if len(recv_data) > 0:
-            self.incoming.put(recv_data)
-        else:
-            # socket appears to be closed at other end
-            try:
-                self.sel.unregister(sock)
-            except (KeyError, ValueError):
-                # raises KeyError if socket is not registered
-                pass
-            #ctx.sock = None
-            try:
-                sock.close()
-            except Exception:
-                pass
+        with self._lock:
+            if self._closed:
+                raise ConnectionError('transport is closed')
+            if self._sock is not None:
+                return self._sock
 
-    def _service_write(self, sock, ctx):
-        # service outgoing
-        if len(self.outgoing) > 0:
-            buf = self.outgoing.popleft()
+            # Do not dial faster than reconnect_interval, so that a service
+            # which is down is asked politely rather than continuously.
+            since = time.monotonic() - self._last_attempt
+            if since < self.reconnect_interval:
+                raise ConnectionError(
+                    'not reconnecting to %s yet; last attempt %.2fs ago'
+                    % (self.endpoint, since))
+            self._last_attempt = time.monotonic()
+
+            sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            sock.settimeout(self.connect_timeout)
             try:
-                ctx.packer.send(sock, buf)
-            except ConnectionError as e:
-                # socket appears to be closed at other end
-                # save buf in case we reconnect and send on another socket
-                self.outgoing.appendleft(buf)
-                try:
-                    self.sel.unregister(sock)
-                except (KeyError, ValueError):
-                    # raises KeyError if socket is not registered
-                    pass
-                #ctx.sock = None
+                sock.connect(self.endpoint)
+            except OSError as e:
                 try:
                     sock.close()
                 except Exception:
                     pass
+                raise ConnectionError('could not connect to %s: %s'
+                                      % (self.endpoint, e)) from None
 
-    def process_events(self):
-        with self.lock:
-            events = self.sel.select(timeout=self._process_timeout)
-            out_events = []
-            # process read events
-            for key, mask in events:
-                if mask & selectors.EVENT_READ:
-                    sock, ctx = key.fileobj, key.data
-                    self._service_read(sock, ctx)
-                if mask & selectors.EVENT_WRITE:
-                    out_events.append(key)
+            # No timeout once connected: the reader blocks until a message
+            # arrives, which may be a long time on a quiet connection.
+            sock.settimeout(None)
+            sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
 
-            # process pending writes
-            for key in out_events:
-                sock, ctx = key.fileobj, key.data
-                self._service_write(sock, ctx)
+            self._sock = sock
+            self._generation += 1
+            self._reader = threading.Thread(
+                target=self._read_forever, args=(sock, self._generation),
+                name='tcp-client-reader')
+            self._reader.daemon = True
+            self._reader.start()
+            self._log('connected to %s' % (self.endpoint,))
+            return sock
 
-    def receive_reply(self, timeout: Any = None) -> bytes:
-        start_time = time.time()
-        reply = None
+    def _drop(self, generation, why):
+        """Forget the current connection, if it is still the one named.
+
+        The generation check keeps a reader that has just noticed a dead
+        socket from tearing down the replacement somebody else has already
+        put in its place.
+        """
+        with self._lock:
+            if self._generation != generation or self._sock is None:
+                return
+            self._log('lost the connection to %s: %s' % (self.endpoint, why))
+            try:
+                self._sock.close()
+            except Exception:
+                pass
+            self._sock = None
+
+    def _read_forever(self, sock, generation):
+        """Own the receiving end of one connection."""
         while True:
             try:
-                reply = self.incoming.get(block=False)
-                break
-            except queue.Empty:
-                self.process_events()
-
-                if (timeout is not None and
-                    time.time() - start_time > timeout):
-                    raise TimeoutError("receive_reply() timed out")
-
-        return reply
+                message = self.packer.recv(sock)
+            except Exception as e:
+                self._drop(generation, e)
+                return
+            if not message:
+                self._drop(generation, 'closed by the far end')
+                return
+            self.incoming.put(message)
 
     def send_message_noblock(self, message: bytes) -> None:
-        self.outgoing.append(message)
+        """Send without waiting for the reply, connecting if need be."""
+        with self._lock:
+            sock = self._ensure_connection()
+            generation = self._generation
+            try:
+                self.packer.send(sock, message)
+            except Exception as e:
+                self._drop(generation, e)
+                raise ConnectionError('could not send to %s: %s'
+                                      % (self.endpoint, e)) from None
 
-        self.process_events()
+    def receive_reply(self, timeout: Any = None) -> bytes:
+        """Return the next reply to arrive, from any outstanding request.
+
+        :raises TimeoutError: when nothing arrived within ``timeout``.
+        """
+        try:
+            return self.incoming.get(
+                block=True, timeout=timeout if timeout is not None else None)
+        except queue.Empty:
+            raise TimeoutError('no reply within %s seconds' % (timeout,))
 
     def send_message(self, message: bytes, expect_reply: bool = True,
                      timeout: Any = None) -> bytes:
+        """Send and wait for a reply.
 
+        Note that with several calls in flight this returns whichever reply
+        arrives first, not necessarily the one for this message -- sorting
+        them out is the job of a client that tracks correlation ids.
+        """
         self.send_message_noblock(message)
+        if expect_reply:
+            return self.receive_reply(timeout=timeout)
 
-        if not expect_reply:
-            return
-
-        return self.receive_reply(timeout=timeout)
+    def close(self) -> None:
+        """Close the connection and stop reconnecting."""
+        with self._lock:
+            self._closed = True
+            generation, self._generation = self._generation, self._generation
+            if self._sock is not None:
+                try:
+                    self._sock.close()
+                except Exception:
+                    pass
+                self._sock = None
 
 
 #: Former name of :py:class:`NonBlockingTcpClientTransport`.  It was
