@@ -3,6 +3,17 @@
 from typing import Any, Tuple
 
 
+class TransportTimeout(Exception):
+    """Raised by :py:meth:`ServerTransport.receive_message` when no message
+    arrived within the transport's poll interval.
+
+    This is not an error condition.  Transports that block indefinitely in
+    ``receive_message`` leave a server loop no chance to notice that it has
+    been asked to shut down; a transport that polls instead raises this so
+    that the loop can test its termination flag and go back to waiting.
+    """
+
+
 class ServerTransport(object):
     """Abstract base class for all server transports.
 
@@ -83,27 +94,33 @@ class ClientTransport(object):
         raise NotImplementedError
 
 
-class AsyncClientTransport(object):
-    def send_message(self, message: bytes, expect_reply: bool = True) -> bytes:
-        raise NotImplementedError
+class NonBlockingClientTransport(ClientTransport):
+    """Abstract base class for client transports that can send without
+    waiting for the reply.
+
+    An ordinary :py:class:`ClientTransport` couples sending a request to
+    receiving its reply, so only one call can be outstanding at a time.  This
+    interface separates the two, which is what lets
+    :py:class:`~tinyrpc.client_multiplexing.MultiplexingRPCClient` keep
+    several calls in flight over a single transport and match each reply to
+    its request afterwards.
+
+    Note that :py:meth:`receive_reply` returns whatever arrived next, not the
+    reply to any particular request; sorting them out is the client's job and
+    requires a protocol that puts a correlation id on the reply.
+    """
 
     def send_message_noblock(self, message: bytes) -> None:
+        """Send a message without waiting for a reply.
+
+        :param bytes message: The request to send to the server.
+        """
         raise NotImplementedError
 
     def receive_reply(self, timeout: Any = None) -> bytes:
-        raise NotImplementedError
+        """Return the next reply to arrive, from any outstanding request.
 
-
-class AsyncClientContext:
-
-    def done(self):
-        raise NotImplementedError
-
-    def result(self, timeout=None):
-        raise NotImplementedError
-
-    def add_done_callback(self, fn):
-        raise NotImplementedError
-
-    def set_result(self, result):
+        :param timeout: Seconds to wait, or ``None`` to wait indefinitely.
+        :raises TimeoutError: when nothing arrived within ``timeout``.
+        """
         raise NotImplementedError

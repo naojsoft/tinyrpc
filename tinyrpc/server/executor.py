@@ -9,6 +9,7 @@ from typing import Callable
 import threading
 
 from . import RPCServer
+from ..transports import TransportTimeout
 
 
 class RPCServerExecutor(RPCServer):
@@ -32,11 +33,31 @@ class RPCServerExecutor(RPCServer):
         self.executor.submit(func, *args, **kwargs)
 
     def start(self):
+        """Start the transport, if it needs starting, then the serve loop."""
+        start = getattr(self.transport, 'start', None)
+        if callable(start):
+            start()
         self.executor.submit(self.serve_forever)
 
     def serve_forever(self):
         while not self.ev_quit.is_set():
-            self.receive_one_message()
+            try:
+                self.receive_one_message()
+            except TransportTimeout:
+                # No request arrived within the transport's poll interval.
+                # That is how a polling transport gives us this chance to
+                # re-test ev_quit, so just go round again.
+                continue
 
     def stop(self):
+        """Ask the serve loop to exit, and shut the transport down.
+
+        Setting ``ev_quit`` alone only ends the loop once ``receive_one_message``
+        returns.  Transports that poll raise :py:exc:`TransportTimeout` and so
+        notice promptly; ones that block indefinitely will not exit until the
+        next request arrives.
+        """
         self.ev_quit.set()
+        stop = getattr(self.transport, 'stop', None)
+        if callable(stop):
+            stop()

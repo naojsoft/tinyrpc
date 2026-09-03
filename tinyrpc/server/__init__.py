@@ -58,6 +58,40 @@ class RPCServer(object):
     not the interpreted meaning of that data.
     It is therefore possible that the binary stream is unreadable without further translation.
     """
+    authenticator = None
+    """Authenticate and authorise a request before it is dispatched.
+
+    When this attribute is set to a callable it is called after a message has
+    been parsed but before the dispatcher is asked to handle it.  It should
+    raise an exception to refuse the request; the exception is turned into an
+    error response in the same way as one raised by the called method.
+
+    The callable should accept two positional parameters:
+
+    :param any context: The context returned by
+        :py:meth:`~tinyrpc.transports.ServerTransport.receive_message`.
+        What it holds is up to the transport;
+        :py:class:`~tinyrpc.transports.http_server.HttpServerTransport`, for
+        instance, provides ``client_address`` and ``auth``.
+    :param request: The parsed :py:class:`~tinyrpc.protocols.RPCRequest`.
+
+    Example:
+
+    .. code-block:: python
+
+        def only_from_localhost(context, request):
+            host, _port = context.client_address
+            if host != '127.0.0.1':
+                raise PermissionError('go away')
+
+        server = RPCServer(transport, protocol, dispatcher)
+        server.authenticator = only_from_localhost
+
+    Keeping this on the server rather than in the protocol or the dispatcher
+    is deliberate: it is the one place that can see both what the transport
+    knows about the caller and what the protocol made of the request, so the
+    same policy works whichever of the two is swapped out.
+    """
     def __init__(
             self, transport: ServerTransport, protocol: RPCProtocol,
             dispatcher: RPCDispatcher
@@ -66,6 +100,7 @@ class RPCServer(object):
         self.protocol = protocol
         self.dispatcher = dispatcher
         self.trace = None
+        self.authenticator = None
 
     def serve_forever(self) -> None:
         """Handle requests forever.
@@ -105,9 +140,19 @@ class RPCServer(object):
             except tinyrpc.exc.RPCError as e:
                 response = e.error_respond()
             else:
-                response = self.dispatcher.dispatch(
-                    request, getattr(self.protocol, '_caller', None)
-                )
+                if callable(self.authenticator):
+                    try:
+                        self.authenticator(context, request)
+                    except Exception as e:
+                        response = request.error_respond(e)
+                    else:
+                        response = self.dispatcher.dispatch(
+                            request, getattr(self.protocol, '_caller', None)
+                        )
+                else:
+                    response = self.dispatcher.dispatch(
+                        request, getattr(self.protocol, '_caller', None)
+                    )
 
             # send reply
             if response is not None:
@@ -135,7 +180,7 @@ class RPCServer(object):
         func(*args, **kwargs)
 
 
-class AsyncRPCServer(RPCServer):
+class AsyncioRPCServer(RPCServer):
 
     def __init__(
             self, transport: ServerTransport, protocol: RPCProtocol,

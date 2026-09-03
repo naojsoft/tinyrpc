@@ -12,7 +12,8 @@ import queue
 import time
 import asyncio
 
-from . import ServerTransport, ClientTransport, AsyncClientTransport
+from . import (ServerTransport, ClientTransport,
+               NonBlockingClientTransport)
 
 max_pkt_size = 4096
 
@@ -261,7 +262,23 @@ class TcpServerTransport(ServerTransport):
         return cls(sock, packer=packer)
 
 
-class AsyncTcpClientTransport(AsyncClientTransport):
+class NonBlockingTcpClientTransport(NonBlockingClientTransport):
+    """A TCP client transport that can send without waiting for the reply.
+
+    Holds one connection open for the life of the transport and multiplexes
+    requests over it, so it pairs with
+    :py:class:`~tinyrpc.client_multiplexing.MultiplexingRPCClient` and a
+    protocol that carries a correlation id.
+
+    TODO: there is no reconnection.  The socket is opened once in __init__;
+    if it drops, ``_service_write`` puts the pending buffer back and
+    unregisters the socket, but nothing ever dials again, so the transport
+    stays dead.  A connect-per-call transport gets recovery for free and this
+    one does not, which matters wherever a service may be restarted
+    underneath a long-lived client.  Fixing it means deciding on a retry
+    policy (backoff, bounded attempts) and what to do with calls that were
+    already in flight when the link went down.
+    """
 
     def __init__(self,
                  endpoint: tuple[str, int],
@@ -380,6 +397,13 @@ class AsyncTcpClientTransport(AsyncClientTransport):
             return
 
         return self.receive_reply(timeout=timeout)
+
+
+#: Former name of :py:class:`NonBlockingTcpClientTransport`.  It was
+#: misleading: this transport is threaded and has nothing to do with
+#: :py:mod:`asyncio` (contrast :py:class:`AsyncioTcpClientTransport`).
+#: TODO: remove once nothing refers to it.
+AsyncTcpClientTransport = NonBlockingTcpClientTransport
 
 
 class TransportPacker:
