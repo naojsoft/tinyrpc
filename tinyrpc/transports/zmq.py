@@ -5,9 +5,12 @@ from __future__ import absolute_import  # needed for zmq import
 
 from typing import Tuple, Any, Dict
 
+import threading
+import time
+
 import zmq
 
-from . import ServerTransport, ClientTransport
+from . import ServerTransport, ClientTransport, TransportTimeout
 from .. import exc
 
 
@@ -18,18 +21,86 @@ class ZmqServerTransport(ServerTransport):
                    endpoint.
     """
 
-    def __init__(self, socket: zmq.Socket) -> None:
+    #: How long a single poll waits before the lock is released so that
+    #: anything else wanting the socket can have a turn.
+    POLL_SLICE_MS = 50
+
+    def __init__(self, socket: zmq.Socket,
+                 poll_timeout: float = 0.5) -> None:
         self.socket = socket
+        self.poll_timeout = poll_timeout
+        self.endpoint = None
+
+        # A 0mq socket must not be touched by two threads at once, and three
+        # of them want this one: the server loop polling and receiving, the
+        # worker threads sending replies, and whoever calls stop().  Using it
+        # unguarded does not merely interleave badly -- it segfaults.
+        self._lock = threading.RLock()
+        self._closed = False
+
+    def start(self) -> None:
+        """Nothing to start: the socket is already bound and listening."""
+
+    def stop(self) -> None:
+        """Close the socket.
+
+        Taken under the same lock as everything else, so this waits for a
+        poll or a send in progress rather than pulling the socket out from
+        under it.
+        """
+        with self._lock:
+            if self._closed:
+                return
+            self._closed = True
+            try:
+                self.socket.close(linger=0)
+            except Exception:
+                pass
 
     def receive_message(self) -> Tuple[Any, bytes]:
-        msg = self.socket.recv_multipart()
-        return msg[:-1], msg[-1]
+        """Return the next ``(context, message)`` pair.
+
+        :raises TransportTimeout: when nothing arrived within
+            ``poll_timeout``.  Without this the server loop would sit in
+            ``recv_multipart`` and not notice it had been asked to stop until
+            the next request happened to arrive.
+
+        The wait is made of short slices rather than one long poll, so that a
+        worker with a reply to send is not kept waiting for the socket for
+        the whole interval.
+        """
+        deadline = None
+        if self.poll_timeout is not None:
+            deadline = time.monotonic() + self.poll_timeout
+
+        while True:
+            with self._lock:
+                if self._closed:
+                    raise TransportTimeout()
+
+                remaining_ms = self.POLL_SLICE_MS
+                if deadline is not None:
+                    left = (deadline - time.monotonic()) * 1000
+                    if left <= 0:
+                        raise TransportTimeout()
+                    remaining_ms = min(self.POLL_SLICE_MS, int(left) or 1)
+
+                if self.socket.poll(remaining_ms, zmq.POLLIN):
+                    msg = self.socket.recv_multipart()
+                    return msg[:-1], msg[-1]
+
+            if deadline is None:
+                continue
 
     def send_reply(self, context: Any, reply: bytes) -> None:
-        self.socket.send_multipart(context + [reply])
+        with self._lock:
+            if self._closed:
+                return
+            self.socket.send_multipart(context + [reply])
 
     @classmethod
-    def create(cls, zmq_context: zmq.Context, endpoint: str) -> 'ZmqServerTransport':
+    def create(cls, zmq_context: zmq.Context, endpoint: str,
+               poll_timeout: float = 0.5) -> 'ZmqServerTransport':
         """Create new server transport.
 
         Instead of creating the socket yourself, you can call this function and
@@ -39,11 +110,22 @@ class ZmqServerTransport(ServerTransport):
         green (gevent) 0mq sockets as well.
 
         :param zmq_context: A 0mq context.
-        :param endpoint: The endpoint clients will connect to.
+        :param endpoint: The endpoint clients will connect to.  A port of 0
+            asks the OS to choose one, which is then readable back from
+            :py:attr:`endpoint`.
         """
         socket = zmq_context.socket(zmq.ROUTER)
-        socket.bind(endpoint)
-        return cls(socket)
+        transport = cls(socket, poll_timeout=poll_timeout)
+
+        if endpoint.endswith(':0'):
+            base = endpoint.rsplit(':', 1)[0]
+            port = socket.bind_to_random_port(base)
+            transport.endpoint = '%s:%d' % (base, port)
+        else:
+            socket.bind(endpoint)
+            transport.endpoint = endpoint
+
+        return transport
 
 
 class ZmqClientTransport(ClientTransport):
@@ -60,6 +142,18 @@ class ZmqClientTransport(ClientTransport):
     def __init__(self, socket: zmq.Socket, timeout: float = None) -> None:
         self.socket = socket
         self.timeout = timeout
+
+    def close(self) -> None:
+        """Release the socket.
+
+        A caller that builds a transport per call -- which is how a
+        connectionless client works -- would otherwise leave a socket behind
+        each time, to be closed whenever the garbage collector got to it.
+        """
+        try:
+            self.socket.close(linger=0)
+        except Exception:
+            pass
 
     def send_message(self, message: bytes, expect_reply: bool = True) -> bytes:
         self.socket.send(message)
