@@ -19,6 +19,69 @@ from .. import (
 multicall_return_token = '###multicall.return###'
 
 
+class LargeIntMarshaller(xmlrpc.client.Marshaller):
+    """A Marshaller that emits Python ints of any size as ``<int>``.
+
+    Standard XML-RPC defines ``<int>`` as a signed 32-bit value, and the
+    stdlib marshaller raises OverflowError for anything wider.  Several
+    implementations send wider values anyway, and the stdlib *parser*
+    accepts them, so this is interoperable in practice with anything that
+    parses with Python -- but it is an extension, not the standard, which is
+    why it is opt-in.  See :py:class:`XMLRPCProtocol`'s ``allow_large_ints``.
+    """
+
+    # A copy, so that enabling this cannot alter the stdlib marshaller for
+    # everyone else in the process.
+    dispatch = dict(xmlrpc.client.Marshaller.dispatch)
+
+    def dump_large_int(self, value, write):
+        write("<value><int>%d</int></value>" % value)
+
+    dispatch[int] = dump_large_int
+
+
+def dumps(params, methodname=None, methodresponse=None, encoding=None,
+          allow_none=False, allow_large_ints=False):
+    """As :py:func:`xmlrpc.client.dumps`, with an oversized-int option.
+
+    Delegates to the stdlib unless ``allow_large_ints`` is set, in which case
+    it does the same work with :py:class:`LargeIntMarshaller`.  The stdlib
+    function offers no way to supply a marshaller, so that path is spelled
+    out here.
+    """
+    if not allow_large_ints:
+        return xmlrpc.client.dumps(params, methodname=methodname,
+                                   methodresponse=methodresponse,
+                                   encoding=encoding, allow_none=allow_none)
+
+    if not isinstance(params, (tuple, xmlrpc.client.Fault)):
+        raise TypeError("argument must be tuple or Fault instance")
+    if isinstance(params, xmlrpc.client.Fault):
+        methodresponse = 1
+    elif methodresponse and isinstance(params, tuple):
+        if len(params) != 1:
+            raise ValueError("response tuple must be a singleton")
+
+    if not encoding:
+        encoding = "utf-8"
+
+    data = LargeIntMarshaller(encoding, allow_none).dumps(params)
+
+    if encoding != "utf-8":
+        xmlheader = "<?xml version='1.0' encoding='%s'?>\n" % str(encoding)
+    else:
+        xmlheader = "<?xml version='1.0'?>\n"
+
+    if methodname:
+        return "".join((xmlheader,
+                        "<methodCall>\n<methodName>", methodname,
+                        "</methodName>\n", data, "</methodCall>\n"))
+    elif methodresponse:
+        return "".join((xmlheader, "<methodResponse>\n", data,
+                        "</methodResponse>\n"))
+    return data
+
+
 class FixedErrorMessageMixin(object):
     """Combines XML RPC exceptions with the generic RPC exceptions.
 
@@ -190,6 +253,7 @@ class XMLRPCSuccessResponse(RPCResponse):
         super().__init__()
 
         self.allow_none = False
+        self.allow_large_ints = False
 
     def serialize(self) -> bytes:
         """Returns a serialization of the response.
@@ -202,18 +266,21 @@ class XMLRPCSuccessResponse(RPCResponse):
         # result should be a 1-tuple
         result = (self.result,)
         try:
-            res = xmlrpc.client.dumps(result, methodresponse=True,
-                                      allow_none=self.allow_none).encode()
+            res = dumps(result, methodresponse=True,
+                        allow_none=self.allow_none,
+                        allow_large_ints=self.allow_large_ints).encode()
             return res
 
         except xmlrpc.client.Fault as e:
-            return xmlrpc.client.dumps(e, methodresponse=True,
-                                       allow_none=self.allow_none).encode()
+            return dumps(e, methodresponse=True,
+                         allow_none=self.allow_none,
+                         allow_large_ints=self.allow_large_ints).encode()
 
         except Exception as e:
             fault = xmlrpc.client.Fault(1, str(e))
-            return xmlrpc.client.dumps(fault, methodresponse=True,
-                                       allow_none=self.allow_none).encode()
+            return dumps(fault, methodresponse=True,
+                         allow_none=self.allow_none,
+                         allow_large_ints=self.allow_large_ints).encode()
 
 
 class XMLRPCErrorResponse(RPCErrorResponse):
@@ -261,6 +328,7 @@ class XMLRPCErrorResponse(RPCErrorResponse):
         super().__init__()
 
         self.allow_none = False
+        self.allow_large_ints = False
 
     def serialize(self) -> bytes:
         """Returns a serialization of the error.
@@ -272,8 +340,9 @@ class XMLRPCErrorResponse(RPCErrorResponse):
         """
         fault = xmlrpc.client.Fault(self._xmlrpc_error_code,
                                     str(self.error))
-        return xmlrpc.client.dumps(fault, methodresponse=True,
-                                   allow_none=self.allow_none).encode()
+        return dumps(fault, methodresponse=True,
+                     allow_none=self.allow_none,
+                     allow_large_ints=self.allow_large_ints).encode()
 
 
 def _get_code_message_and_data(error: Union[Exception, str]
@@ -316,6 +385,7 @@ class XMLRPCRequest(RPCRequest):
     """Defines a XML RPC request."""
     def __init__(self):
         super().__init__()
+        self.allow_large_ints = False
         self.one_way = False
         """Request or Notification.
 
@@ -421,6 +491,7 @@ class XMLRPCRequest(RPCRequest):
         response.result = result
         response.unique_id = self.unique_id
         response.allow_none = self.allow_none
+        response.allow_large_ints = self.allow_large_ints
 
         return response
 
@@ -432,8 +503,9 @@ class XMLRPCRequest(RPCRequest):
         :return: The serialized encoded request object.
         :rtype: bytes
         """
-        return xmlrpc.client.dumps(self.args, methodname=self.method,
-                                   allow_none=self.allow_none).encode()
+        return dumps(self.args, methodname=self.method,
+                     allow_none=self.allow_none,
+                     allow_large_ints=self.allow_large_ints).encode()
 
 
 
@@ -547,13 +619,22 @@ class XMLRPCProtocol(RPCBatchProtocol):
             id_generator: Optional[Generator[object, None, None]] = None,
             *args,
             allow_none: bool = False,
+            allow_large_ints: bool = False,
             use_builtin_types: bool = False,
             **kwargs
     ) -> None:
+        """
+        :param allow_none: Marshal ``None`` as ``<nil/>``, an extension to
+            the standard that the stdlib also offers.
+        :param allow_large_ints: Marshal Python ints too wide for the
+            standard's signed 32-bit ``<int>`` instead of raising
+            OverflowError.  See :py:class:`LargeIntMarshaller`.
+        """
 
         super().__init__(*args, **kwargs)
 
         self.allow_none = allow_none
+        self.allow_large_ints = allow_large_ints
         self.use_builtin_types = use_builtin_types
 
         self._id_generator = id_generator or default_id_generator()
@@ -570,6 +651,7 @@ class XMLRPCProtocol(RPCBatchProtocol):
         """
         req = XMLRPCRequest()
         req.allow_none = self.allow_none
+        req.allow_large_ints = self.allow_large_ints
         return req
 
     def create_batch_request(
@@ -621,6 +703,7 @@ class XMLRPCProtocol(RPCBatchProtocol):
         request = self.request_factory()
         request.one_way = one_way
         request.allow_none = self.allow_none
+        request.allow_large_ints = self.allow_large_ints
 
         if not one_way:
             request.unique_id = self._get_unique_id()
