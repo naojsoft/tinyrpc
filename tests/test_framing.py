@@ -267,7 +267,7 @@ def test_credentials_alone_prove_nothing():
 
 
 def test_a_verified_signature_names_a_principal():
-    f = Framing(layers=[Signature(KEY, principal='gen2-internal')])
+    f = Framing(layers=[Signature({'gen2-internal': KEY})])
     got = f.unwrap(f.wrap(BODY))
 
     assert got.principal == 'gen2-internal'
@@ -279,7 +279,7 @@ def test_a_forged_message_never_yields_a_principal():
     """A failed signature raises, so no caller ever sees a principal from a
     message that did not verify."""
     sender = Framing(layers=[Signature(b'wrong key' + b'-' * 23)])
-    receiver = Framing(layers=[Signature(KEY, principal='gen2-internal')])
+    receiver = Framing(layers=[Signature({'gen2-internal': KEY})])
     with pytest.raises(FramingError):
         receiver.unwrap(sender.wrap(BODY))
 
@@ -295,8 +295,8 @@ def test_a_sender_cannot_assert_a_principal_through_credentials():
 
 
 def test_signing_without_a_principal_still_verifies():
-    """A shared key with no name attached still proves possession; it just
-    has no identity to report."""
+    """An unnamed key still proves possession; it just has no identity to
+    report.  Insisting a message be signed at all is the Framing's job."""
     f = Framing(layers=[Signature(KEY)])
     got = f.unwrap(f.wrap(BODY))
     assert got.payload == BODY
@@ -314,7 +314,7 @@ def test_encryption_reports_no_principal():
 
 def test_signed_and_credentialed_together():
     """Both may be present, and they still mean different things."""
-    f = Framing(layers=[Signature(KEY, principal='gen2-internal')])
+    f = Framing(layers=[Signature({'gen2-internal': KEY})])
     got = f.unwrap(f.wrap(BODY,
                           credentials=Credentials('bob', 'x').encode()))
     assert got.principal == 'gen2-internal'
@@ -327,3 +327,184 @@ def test_the_repr_does_not_leak_the_secret():
                           credentials=Credentials('bob', 'hunter2').encode()))
     assert 'hunter2' not in repr(got)
     assert 'bob' not in repr(got)
+
+
+# ---------------------------------------------------- per-service keys --
+
+KEY_A = b'a' * 32
+KEY_B = b'b' * 32
+
+#: Where a key id sits in a signed-only message: header, the section's own
+#: 2-byte length, then the stamp.
+_ID_AT = framing.HEADER_LEN + 2 + Signature._STAMP_LEN
+
+
+def receiver(**kw):
+    """One end holding both services' keys, as a name service would."""
+    return Framing(layers=[Signature({'status': KEY_A, 'taskmgr': KEY_B},
+                                     sign_as='status', **kw)])
+
+
+def sender(name, key, **kw):
+    return Framing(layers=[Signature({name: key}, **kw)])
+
+
+def test_a_verified_message_names_which_service_sent_it():
+    """The point of per-service keys: not "someone we trust" but "status"."""
+    end = receiver()
+    assert end.unwrap(sender('status', KEY_A).wrap(BODY)).principal == 'status'
+    assert end.unwrap(sender('taskmgr', KEY_B).wrap(BODY)).principal == 'taskmgr'
+
+
+def test_one_service_cannot_sign_as_another():
+    """Holding status's key must not let it speak as taskmgr.  The id is a
+    claim; the key is the proof, and they have to agree."""
+    liar = sender('taskmgr', KEY_A)          # taskmgr's name, status's key
+    with pytest.raises(FramingError) as excinfo:
+        receiver().unwrap(liar.wrap(BODY))
+    assert 'does not match' in str(excinfo.value)
+
+
+def test_relabelling_a_genuine_message_cannot_promote_it():
+    """The id is covered by the MAC, so it cannot be edited on the wire.
+
+    Two names on one key isolate that: nothing but the MAC's coverage of the
+    id distinguishes them, and getting it wrong would let anyone holding the
+    key pick which principal they arrive as.
+    """
+    end = Framing(layers=[Signature({'aaa': (KEY_A, 'lowly'),
+                                     'bbb': (KEY_A, 'admin')},
+                                    sign_as='aaa')])
+    assert end.unwrap(end.wrap(BODY)).principal == 'lowly'
+
+    wrapped = bytearray(end.wrap(BODY))
+    assert bytes(wrapped[_ID_AT:_ID_AT + 3]) == b'aaa', "found the id"
+    wrapped[_ID_AT:_ID_AT + 3] = b'bbb'
+
+    with pytest.raises(FramingError) as excinfo:
+        end.unwrap(bytes(wrapped))
+    assert 'does not match' in str(excinfo.value)
+
+
+def test_a_key_this_end_does_not_know_is_refused():
+    with pytest.raises(FramingError) as excinfo:
+        receiver().unwrap(sender('stranger', KEY_A).wrap(BODY))
+    assert 'stranger' in str(excinfo.value)
+
+
+def test_the_principal_defaults_to_the_key_id():
+    f = Framing(layers=[Signature({'status': KEY_A})])
+    assert f.unwrap(f.wrap(BODY)).principal == 'status'
+
+
+def test_a_key_can_speak_for_a_different_principal():
+    """The id names the key; who that key acts as can be said separately."""
+    f = Framing(layers=[Signature({'status-2024': (KEY_A, 'status')})])
+    assert f.unwrap(f.wrap(BODY)).principal == 'status'
+
+
+def test_an_unnamed_key_names_nobody():
+    f = Framing(layers=[Signature(KEY_A)])
+    got = f.unwrap(f.wrap(BODY))
+    assert got.payload == BODY
+    assert got.principal is None
+
+
+def test_a_choice_of_keys_needs_an_explicit_one_to_sign_with():
+    """Guessing would quietly pick an identity, so it is refused here rather
+    than silently got wrong on every message."""
+    with pytest.raises(ValueError) as excinfo:
+        Signature({'status': KEY_A, 'taskmgr': KEY_B})
+    assert 'which one' in str(excinfo.value)
+
+
+def test_signing_as_a_key_that_is_not_there():
+    with pytest.raises(ValueError) as excinfo:
+        Signature({'status': KEY_A}, sign_as='taskmgr')
+    assert 'taskmgr' in str(excinfo.value)
+
+
+def test_an_empty_key_is_refused():
+    with pytest.raises(ValueError):
+        Signature({'status': b''})
+
+
+def test_no_keys_at_all_is_refused():
+    with pytest.raises(ValueError):
+        Signature({})
+
+
+def test_a_key_id_too_long_to_carry():
+    with pytest.raises(ValueError) as excinfo:
+        Signature({'x' * 256: KEY_A})
+    assert 'too long' in str(excinfo.value)
+
+
+def test_key_ids_survive_the_other_layers():
+    layers = [Deflate(), Encrypt(KEY), Signature({'status': KEY_A})]
+    f = Framing(layers=layers)
+    got = f.unwrap(f.wrap(b'z' * 5000))
+    assert got.payload == b'z' * 5000
+    assert got.principal == 'status'
+
+
+# --------------------------------------------------------- audience --
+
+def test_a_message_for_one_service_is_refused_by_another():
+    """Binding the signature to the callee means a peer that legitimately
+    talks to both cannot have its request replayed at the wrong one."""
+    to_status = sender('gateway', KEY_A, audience='status')
+    at_taskmgr = sender('gateway', KEY_A, audience='taskmgr')
+
+    with pytest.raises(FramingError) as excinfo:
+        at_taskmgr.unwrap(to_status.wrap(BODY))
+    assert 'not signed for this service' in str(excinfo.value)
+
+
+def test_a_matching_audience_round_trips():
+    a = sender('gateway', KEY_A, audience='status')
+    b = sender('gateway', KEY_A, audience='status')
+    assert b.unwrap(a.wrap(BODY)).principal == 'gateway'
+
+
+def test_binding_on_one_end_only_is_refused():
+    """Otherwise a peer could opt out of the binding by leaving it unset."""
+    bound = sender('gateway', KEY_A, audience='status')
+    unbound = sender('gateway', KEY_A)
+
+    with pytest.raises(FramingError):
+        bound.unwrap(unbound.wrap(BODY))
+    with pytest.raises(FramingError):
+        unbound.unwrap(bound.wrap(BODY))
+
+
+def test_the_audience_never_travels():
+    """Each end mixes in its own, so there is nothing on the wire to edit."""
+    wrapped = sender('gateway', KEY_A, audience='status').wrap(BODY)
+    assert b'status' not in wrapped
+
+
+def test_two_services_of_equal_name_length_are_still_distinguished():
+    """Only the length is on the wire, so names of the same length must be
+    separated by the MAC itself."""
+    a = sender('gateway', KEY_A, audience='aaaaaa')
+    b = sender('gateway', KEY_A, audience='bbbbbb')
+    with pytest.raises(FramingError) as excinfo:
+        b.unwrap(a.wrap(BODY))
+    assert 'does not match' in str(excinfo.value)
+
+
+def test_an_audience_too_long_to_bind():
+    with pytest.raises(ValueError):
+        Signature(KEY_A, audience='x' * 256)
+
+
+def test_a_truncated_signature_section():
+    f = Framing(layers=[Signature({'status': KEY_A})])
+    wrapped = bytearray(f.wrap(BODY))
+    # Claim a longer key id than the section can hold.
+    wrapped[_ID_AT - 2] = 250
+    with pytest.raises(FramingError) as excinfo:
+        f.unwrap(bytes(wrapped))
+    assert 'truncated' in str(excinfo.value), \
+        "it should say what is wrong, not blame the key it mis-read"
