@@ -13,7 +13,16 @@ from typing import Any, Callable
 import tinyrpc.exc
 from tinyrpc import RPCProtocol
 from tinyrpc.dispatch import RPCDispatcher
-from tinyrpc.transports import ServerTransport
+from tinyrpc.transports import ServerTransport, TransportTimeout
+
+
+def _is_coroutine_method(dispatcher: RPCDispatcher, request: Any) -> bool:
+    """Whether the method a request names is defined with ``async def``."""
+    try:
+        return asyncio.iscoroutinefunction(
+            dispatcher.get_method(request.method))
+    except Exception:
+        return False
 
 
 class RPCServer(object):
@@ -181,25 +190,55 @@ class RPCServer(object):
 
 
 class AsyncioRPCServer(RPCServer):
+    """An :py:mod:`asyncio` server.
+
+    Note what the dispatcher does and does not do for you here.  An ordinary
+    synchronous method is called directly, on the event loop's thread, so one
+    that blocks stalls every other call in flight -- pass an ``executor`` to
+    have those run off the loop instead.  A method defined with ``async def``
+    is awaited, which the synchronous dispatcher cannot do on its own.
+
+    :param executor: Optional :py:class:`concurrent.futures.Executor` to run
+        synchronous methods on.  Without it they run on the event loop.
+    """
 
     def __init__(
             self, transport: ServerTransport, protocol: RPCProtocol,
-            dispatcher: RPCDispatcher
+            dispatcher: RPCDispatcher, executor: Any = None
     ):
         super().__init__(transport, protocol, dispatcher)
 
+        self.executor = executor
         self.tasks = set()
+        self.ev_quit = asyncio.Event()
+
+    async def stop(self) -> None:
+        """Ask the serve loop to finish, and stop the transport."""
+        self.ev_quit.set()
+        stop = getattr(self.transport, 'stop', None)
+        if stop is not None:
+            result = stop()
+            if asyncio.iscoroutine(result):
+                await result
+        for task in list(self.tasks):
+            task.cancel()
 
     async def serve_forever(self) -> None:
-        """Handle requests forever.
-
-        Starts the server loop; continuously calling :py:meth:`receive_one_message`
-        to process the next incoming request.
-        """
+        """Handle requests until :py:meth:`stop` is awaited."""
         task = asyncio.create_task(self.transport.start())
         self.tasks.add(task)
-        while True:
-            await self.receive_one_message()
+        task.add_done_callback(self.tasks.discard)
+        try:
+            while not self.ev_quit.is_set():
+                try:
+                    await self.receive_one_message()
+                except TransportTimeout:
+                    # No request arrived within the transport's poll
+                    # interval, which is how it gives us the chance to
+                    # re-test ev_quit.
+                    continue
+        finally:
+            task.cancel()
 
     async def receive_one_message(self) -> None:
         """Handle a single request.
@@ -230,9 +269,7 @@ class AsyncioRPCServer(RPCServer):
             except tinyrpc.exc.RPCError as e:
                 response = e.error_respond()
             else:
-                response = self.dispatcher.dispatch(
-                    request, getattr(self.protocol, '_caller', None)
-                )
+                response = await self._dispatch(request)
 
             # send reply
             if response is not None:
@@ -243,6 +280,38 @@ class AsyncioRPCServer(RPCServer):
                 await self.transport.send_reply(context, result)
 
         self._spawn(handle_message, context, message)
+
+    async def _dispatch(self, request: Any) -> Any:
+        """Dispatch a request, awaiting the method if it is a coroutine.
+
+        RPCDispatcher is synchronous: it calls the method and takes whatever
+        comes back as the result, so given an ``async def`` method it would
+        hand back the coroutine object, which then fails to serialize.  A
+        whole async dispatcher is not needed to fix that -- the coroutine is
+        simply awaited here, and the exception it may raise is turned into an
+        error response the same way a synchronous one would be.
+
+        A synchronous method runs on the event loop unless an executor was
+        given, in which case it runs there so that a blocking method does not
+        stall every other call in flight.
+        """
+        caller = getattr(self.protocol, '_caller', None)
+
+        if self.executor is not None and not _is_coroutine_method(
+                self.dispatcher, request):
+            loop = asyncio.get_running_loop()
+            return await loop.run_in_executor(
+                self.executor, self.dispatcher.dispatch, request, caller)
+
+        response = self.dispatcher.dispatch(request, caller)
+
+        result = getattr(response, 'result', None)
+        if asyncio.iscoroutine(result):
+            try:
+                response.result = await result
+            except Exception as e:
+                return request.error_respond(e)
+        return response
 
     def _spawn(self, func: Callable, *args: Any, **kwargs: Any) -> None:
         """Spawn a handler function.

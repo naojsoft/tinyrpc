@@ -7,39 +7,26 @@ Three things in this package are called "async" and only these are
 ``Asyncio*`` transports.  (:py:class:`~tinyrpc.client_multiplexing.
 MultiplexingRPCClient` and the ``NonBlocking*`` transports are threaded.)
 
-They had no tests at all, so what follows covers both what works and what
-does not.  The limitations are pinned deliberately rather than left to be
-rediscovered -- see the tests at the end of the file, which assert current
-behaviour and say what fixing it would mean.
-
 pytest-asyncio is not a dependency here, so each test drives its own loop
 through :py:func:`asyncio.run`.
 """
 
 import asyncio
-import socket
+import time
+from concurrent.futures import ThreadPoolExecutor
 
 import pytest
 
 from tinyrpc.dispatch import RPCDispatcher
 from tinyrpc.protocols.jsonrpc import JSONRPCProtocol
 from tinyrpc.server import AsyncioRPCServer
+from tinyrpc.transports import TransportTimeout
 from tinyrpc.transports.tcp import (AsyncioTcpClientTransport,
                                     AsyncioTcpServerTransport,
-                                    AsyncioTransportPacker)
+                                    AsyncioTransportPacker,
+                                    AsyncioTransportPackerRobust)
 
 HOST = '127.0.0.1'
-
-
-def free_port():
-    """A port nothing is listening on.
-
-    AsyncioTcpServerTransport takes its endpoint up front and never reports
-    what it actually bound, so a port of 0 cannot be read back.
-    """
-    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
-        sock.bind((HOST, 0))
-        return sock.getsockname()[1]
 
 
 def make_dispatcher():
@@ -50,144 +37,189 @@ def make_dispatcher():
     def boom():
         raise ValueError('kaboom')
 
+    async def slow_echo(v):
+        await asyncio.sleep(0.2)
+        return v
+
+    async def async_boom():
+        await asyncio.sleep(0)
+        raise ValueError('async kaboom')
+
+    def blocking_echo(v):
+        time.sleep(0.2)
+        return v
+
     dispatcher.add_method(boom, 'boom')
+    dispatcher.add_method(slow_echo, 'slow_echo')
+    dispatcher.add_method(async_boom, 'async_boom')
+    dispatcher.add_method(blocking_echo, 'blocking_echo')
     return dispatcher
 
 
-async def serve(port, dispatcher=None, protocol=None):
-    """Start a server, returning it and the task running it."""
-    transport = AsyncioTcpServerTransport((HOST, port))
+async def serve(dispatcher=None, protocol=None, executor=None):
+    """Start a server on a port the OS chooses.
+
+    :return: ``(server, task, port)`` -- the port actually bound, which the
+        transport reports back after binding.
+    """
+    transport = AsyncioTcpServerTransport((HOST, 0))
     server = AsyncioRPCServer(transport, protocol or JSONRPCProtocol(),
-                              dispatcher or make_dispatcher())
+                              dispatcher or make_dispatcher(),
+                              executor=executor)
     task = asyncio.create_task(server.serve_forever())
-    await asyncio.sleep(0.2)          # let it bind
-    return server, task
+    for _ in range(200):
+        await asyncio.sleep(0.01)
+        if transport.endpoint[1] != 0:
+            break
+    assert transport.endpoint[1] != 0, "the server never bound"
+    return server, task, transport.endpoint[1]
 
 
-async def shut_down(task, *transports):
-    for transport in transports:
-        close = getattr(transport, 'close', None)
-        if close is not None:
-            await close()
+async def shut_down(server, task, *clients):
+    for client in clients:
+        await client.close()
+    await server.stop()
     task.cancel()
     try:
         await task
-    except (asyncio.CancelledError, Exception):
+    except BaseException:
         pass
 
 
-# --------------------------------------------------------------- working --
+async def call(client, protocol, method, args, timeout=5.0):
+    """Make one call.
+
+    Bounded, so that a server which never answers -- because a handler
+    raised, say, and its task's exception went unread -- fails the test
+    rather than hanging it.
+    """
+    reply = await asyncio.wait_for(
+        client.send_message(
+            protocol.create_request(method, args, None).serialize()),
+        timeout=timeout)
+    return protocol.parse_reply(reply)
+
+
+# --------------------------------------------------------------- calling --
 
 def test_a_call_round_trips():
     async def main():
-        port = free_port()
-        _server, task = await serve(port)
+        server, task, port = await serve()
         client = AsyncioTcpClientTransport((HOST, port))
-        protocol = JSONRPCProtocol()
         try:
-            request = protocol.create_request('add', [3, 4], None)
-            reply = await client.send_message(request.serialize())
-            return protocol.parse_reply(reply).result
+            return (await call(client, JSONRPCProtocol(), 'add', [3, 4])).result
         finally:
-            await shut_down(task, client)
+            await shut_down(server, task, client)
 
     assert asyncio.run(main()) == 7
 
 
 def test_the_connection_is_opened_on_the_first_send():
     """Regression: the constructor used to call the connect() coroutine and
-    drop it, so the transport had no reader or writer and could not be used
-    at all."""
+    drop it, so the transport had no reader or writer and was unusable."""
     async def main():
-        port = free_port()
-        _server, task = await serve(port)
+        server, task, port = await serve()
         client = AsyncioTcpClientTransport((HOST, port))
         try:
             assert client.writer is None, "must not dial in the constructor"
-            protocol = JSONRPCProtocol()
-            await client.send_message(
-                protocol.create_request('echo', ['hi'], None).serialize())
+            await call(client, JSONRPCProtocol(), 'echo', ['hi'])
             assert client.writer is not None, "the first send should dial"
         finally:
-            await shut_down(task, client)
+            await shut_down(server, task, client)
 
     asyncio.run(main())
 
 
 def test_several_calls_reuse_one_connection():
     async def main():
-        port = free_port()
-        _server, task = await serve(port)
+        server, task, port = await serve()
         client = AsyncioTcpClientTransport((HOST, port))
         protocol = JSONRPCProtocol()
         try:
-            results = []
-            for n in range(5):
-                request = protocol.create_request('echo', [n], None)
-                reply = await client.send_message(request.serialize())
-                results.append(protocol.parse_reply(reply).result)
-            return results
+            return [(await call(client, protocol, 'echo', [n])).result
+                    for n in range(5)]
         finally:
-            await shut_down(task, client)
+            await shut_down(server, task, client)
 
     assert asyncio.run(main()) == [0, 1, 2, 3, 4]
 
 
 def test_a_failing_method_comes_back_as_an_error():
     async def main():
-        port = free_port()
-        _server, task = await serve(port)
+        server, task, port = await serve()
         client = AsyncioTcpClientTransport((HOST, port))
         protocol = JSONRPCProtocol()
         protocol.raises_errors = False
         try:
-            request = protocol.create_request('boom', [], None)
-            reply = await client.send_message(request.serialize())
-            return protocol.parse_reply(reply)
+            return await call(client, protocol, 'boom', [])
         finally:
-            await shut_down(task, client)
+            await shut_down(server, task, client)
 
-    response = asyncio.run(main())
-    assert 'kaboom' in str(response.error)
+    assert 'kaboom' in str(asyncio.run(main()).error)
 
 
 def test_the_client_can_be_closed_and_will_dial_again():
     async def main():
-        port = free_port()
-        _server, task = await serve(port)
+        server, task, port = await serve()
         client = AsyncioTcpClientTransport((HOST, port))
         protocol = JSONRPCProtocol()
         try:
-            await client.send_message(
-                protocol.create_request('echo', ['a'], None).serialize())
+            await call(client, protocol, 'echo', ['a'])
             await client.close()
             assert client.writer is None
-
-            reply = await client.send_message(
-                protocol.create_request('echo', ['b'], None).serialize())
-            return protocol.parse_reply(reply).result
+            return (await call(client, protocol, 'echo', ['b'])).result
         finally:
-            await shut_down(task, client)
+            await shut_down(server, task, client)
 
     assert asyncio.run(main()) == 'b'
 
 
-# ------------------------------------------------------------- the packer --
+# ---------------------------------------------------------------- framing --
 
-def test_the_packer_round_trips_a_small_message():
+def test_a_large_payload_arrives_whole():
+    """Regression: the packer read one 4096-byte chunk with no length
+    prefix, so anything larger arrived truncated."""
     async def main():
-        packer = AsyncioTransportPacker()
+        server, task, port = await serve()
+        client = AsyncioTcpClientTransport((HOST, port))
+        payload = 'x' * 400000
+        try:
+            return (await call(client, JSONRPCProtocol(),
+                               'echo', [payload])).result == payload
+        finally:
+            await shut_down(server, task, client)
+
+    assert asyncio.run(main())
+
+
+def test_the_framed_packer_round_trips_any_size():
+    async def main():
+        packer = AsyncioTransportPackerRobust()
+        for payload in (b'', b'hi', b'x' * 100000):
+            reader = asyncio.StreamReader()
+            reader.feed_data(packer.pack(payload))
+            reader.feed_eof()
+            assert await packer.recv(reader) == payload
+
+    asyncio.run(main())
+
+
+def test_the_framed_packer_keeps_messages_apart():
+    """Two messages back to back must not merge, which is what makes several
+    calls on one connection possible."""
+    async def main():
+        packer = AsyncioTransportPackerRobust()
         reader = asyncio.StreamReader()
-        reader.feed_data(b'hello')
+        reader.feed_data(packer.pack(b'one') + packer.pack(b'two'))
         reader.feed_eof()
-        return await packer.recv(reader)
+        return await packer.recv(reader), await packer.recv(reader)
 
-    assert asyncio.run(main()) == b'hello'
+    assert asyncio.run(main()) == (b'one', b'two')
 
 
-def test_the_packer_refuses_an_empty_read():
+def test_the_framed_packer_reports_a_closed_connection():
     async def main():
-        packer = AsyncioTransportPacker()
+        packer = AsyncioTransportPackerRobust()
         reader = asyncio.StreamReader()
         reader.feed_eof()
         with pytest.raises(ConnectionError):
@@ -196,85 +228,151 @@ def test_the_packer_refuses_an_empty_read():
     asyncio.run(main())
 
 
-# ---------------------------------------------------- pinned limitations --
-
-def test_the_packer_has_no_framing():
-    """Pinned, not endorsed.
-
-    AsyncioTransportPacker reads one chunk of at most 4096 bytes with no
-    length prefix, so a larger message arrives truncated and two smaller ones
-    can arrive as one.  The threaded transports were moved onto
-    TransportPackerRobust for exactly this reason; the asyncio ones have not
-    been, and cannot carry a payload of any size until they are.
-    """
+def test_the_unframed_packer_is_still_available():
+    """Kept for a peer that speaks the old format, and still unframed --
+    which is why it is no longer the default."""
     async def main():
         packer = AsyncioTransportPacker()
-
         reader = asyncio.StreamReader()
         reader.feed_data(b'x' * 10000)
         reader.feed_eof()
-        big = await packer.recv(reader)
+        return await packer.recv(reader)
 
-        reader = asyncio.StreamReader()
-        reader.feed_data(b'one')
-        reader.feed_data(b'two')
-        reader.feed_eof()
-        both = await packer.recv(reader)
-        return big, both
-
-    big, both = asyncio.run(main())
-    assert len(big) == 4096, "a large message is truncated at chunk_size"
-    assert both == b'onetwo', "two messages arrive as one"
+    assert len(asyncio.run(main())) == 4096
 
 
-def test_an_async_method_is_not_awaited():
-    """Pinned, not endorsed.
+# ------------------------------------------------------- async methods --
 
-    RPCDispatcher is synchronous: it calls the method and treats whatever
-    comes back as the result.  Given an `async def` method that is a
-    coroutine object, which then fails to serialize.  Supporting these needs
-    an async-aware dispatcher -- upstream has one on its `asyncio` branch,
-    predating the `caller` parameter this dispatcher now takes.
-    """
-    dispatcher = RPCDispatcher()
+def test_an_async_method_is_awaited():
+    """Regression: the dispatcher is synchronous, so an `async def` method
+    used to come back as a coroutine object that then failed to serialize."""
+    async def main():
+        server, task, port = await serve()
+        client = AsyncioTcpClientTransport((HOST, port))
+        try:
+            return (await call(client, JSONRPCProtocol(),
+                               'slow_echo', ['hi'])).result
+        finally:
+            await shut_down(server, task, client)
 
-    async def slow_add(a, b):
-        await asyncio.sleep(0)
-        return a + b
-
-    dispatcher.add_method(slow_add, 'slow_add')
-    protocol = JSONRPCProtocol()
-
-    request = protocol.parse_request(
-        protocol.create_request('slow_add', [1, 2], None).serialize())
-    response = dispatcher.dispatch(request, None)
-
-    assert asyncio.iscoroutine(response.result), \
-        "the coroutine is returned rather than awaited"
-    with pytest.raises(TypeError):
-        response.serialize()
-    response.result.close()          # or Python warns it was never awaited
+    assert asyncio.run(main()) == 'hi'
 
 
-def test_the_asyncio_server_has_no_way_to_be_stopped():
-    """Pinned, not endorsed.
+def test_an_async_method_that_raises_becomes_an_error():
+    async def main():
+        server, task, port = await serve()
+        client = AsyncioTcpClientTransport((HOST, port))
+        protocol = JSONRPCProtocol()
+        protocol.raises_errors = False
+        try:
+            return await call(client, protocol, 'async_boom', [])
+        finally:
+            await shut_down(server, task, client)
 
-    RPCServerExecutor grew an ev_quit and a stop(); AsyncioRPCServer did not,
-    so its serve_forever() runs until its task is cancelled.  Cancelling
-    works, which is what the tests above do, but there is no orderly
-    shutdown that lets in-flight handlers finish.
-    """
-    assert not hasattr(AsyncioRPCServer, 'stop')
-    assert 'ev_quit' not in AsyncioRPCServer.__init__.__code__.co_names
+    assert 'async kaboom' in str(asyncio.run(main()).error)
 
 
-def test_the_server_transport_does_not_report_the_port_it_bound():
-    """Pinned, not endorsed.
+def test_async_methods_overlap():
+    """Three calls that each await 0.2s should take about 0.2s between them,
+    which is the whole reason to serve on an event loop."""
+    async def main():
+        server, task, port = await serve()
+        clients = [AsyncioTcpClientTransport((HOST, port)) for _ in range(3)]
+        try:
+            started = time.time()
+            results = await asyncio.gather(*[
+                call(c, JSONRPCProtocol(), 'slow_echo', [n])
+                for n, c in enumerate(clients)])
+            return [r.result for r in results], time.time() - started
+        finally:
+            await shut_down(server, task, *clients)
 
-    The threaded transports expose `endpoint` after binding, so a service can
-    ask for port 0 and register what it got.  This one takes its endpoint up
-    front and never updates it, so port 0 cannot be used -- which is why
-    these tests have to find a free port for themselves.
-    """
-    transport = AsyncioTcpServerTransport((HOST, 0))
-    assert transport.endpoint == (HOST, 0)
+    results, elapsed = asyncio.run(main())
+    assert results == [0, 1, 2]
+    assert elapsed < 0.5, "took %.2fs, so they did not overlap" % elapsed
+
+
+def test_a_blocking_method_stalls_the_loop_without_an_executor():
+    """A synchronous method runs on the event loop, so a blocking one holds
+    up every other call.  Pinned so the executor's value is visible."""
+    async def main():
+        server, task, port = await serve()
+        clients = [AsyncioTcpClientTransport((HOST, port)) for _ in range(3)]
+        try:
+            started = time.time()
+            await asyncio.gather(*[
+                call(c, JSONRPCProtocol(), 'blocking_echo', [n])
+                for n, c in enumerate(clients)])
+            return time.time() - started
+        finally:
+            await shut_down(server, task, *clients)
+
+    assert asyncio.run(main()) > 0.5, "0.2s x 3 should have run serially"
+
+
+def test_an_executor_keeps_blocking_methods_off_the_loop():
+    async def main():
+        executor = ThreadPoolExecutor(max_workers=4)
+        server, task, port = await serve(executor=executor)
+        clients = [AsyncioTcpClientTransport((HOST, port)) for _ in range(3)]
+        try:
+            started = time.time()
+            results = await asyncio.gather(*[
+                call(c, JSONRPCProtocol(), 'blocking_echo', [n])
+                for n, c in enumerate(clients)])
+            return [r.result for r in results], time.time() - started
+        finally:
+            await shut_down(server, task, *clients)
+            executor.shutdown(wait=False)
+
+    results, elapsed = asyncio.run(main())
+    assert results == [0, 1, 2]
+    assert elapsed < 0.5, "took %.2fs, so the executor did not help" % elapsed
+
+
+# ------------------------------------------------------------- lifecycle --
+
+def test_the_server_reports_the_port_it_bound():
+    """A port of 0 lets the OS choose, and the transport says what it got,
+    so a service can register it."""
+    async def main():
+        server, task, port = await serve()
+        try:
+            assert port > 0
+            return server.transport.endpoint
+        finally:
+            await shut_down(server, task)
+
+    host, port = asyncio.run(main())
+    assert host == HOST and port > 0
+
+
+def test_the_server_can_be_stopped():
+    """Regression: there was no stop(), so a serve loop ran until its task
+    was cancelled."""
+    async def main():
+        server, task, port = await serve()
+        await server.stop()
+        await asyncio.sleep(0.2)
+        assert server.ev_quit.is_set()
+
+        # and the port is released
+        client = AsyncioTcpClientTransport((HOST, port))
+        with pytest.raises(OSError):
+            await call(client, JSONRPCProtocol(), 'echo', ['hi'])
+        task.cancel()
+
+    asyncio.run(main())
+
+
+def test_the_transport_gives_up_waiting_for_a_request():
+    """What makes stopping possible: receive_message() must not block for
+    ever, or the serve loop could never test its termination flag."""
+    async def main():
+        transport = AsyncioTcpServerTransport((HOST, 0), poll_timeout=0.2)
+        started = time.time()
+        with pytest.raises(TransportTimeout):
+            await transport.receive_message()
+        return time.time() - started
+
+    assert asyncio.run(main()) < 2.0

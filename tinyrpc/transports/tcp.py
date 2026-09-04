@@ -690,7 +690,7 @@ class AsyncioTcpClientTransport(ClientTransport):
         self.endpoint = endpoint
         self.timeout = timeout
         if packer is None:
-            packer = AsyncioTransportPacker()
+            packer = AsyncioTransportPackerRobust()
         self.packer = packer
         self.reader = None
         self.writer = None
@@ -726,83 +726,132 @@ class AsyncioTcpClientTransport(ClientTransport):
 
 
 class AsyncioTcpServerTransport(ServerTransport):
+    """An asyncio TCP server that keeps each client's connection open.
+
+    A coroutine per connection reads requests off it and puts them on a
+    queue; replies are written straight back on the connection they came
+    from.  That mirrors :py:class:`TcpServerTransport`, so the threaded and
+    asyncio servers behave the same way and speak the same framing.
+
+    :param endpoint: ``(host, port)`` to bind.  A port of 0 asks the OS to
+        choose, and :py:attr:`endpoint` is updated to what it chose, so a
+        service can register the port it actually got.
+    :param packer: Framing.  Length-prefixed by default.
+    :param poll_timeout: How long :py:meth:`receive_message` waits before
+        raising :py:exc:`TransportTimeout`, which lets a server loop notice
+        it has been asked to stop.
+    """
+
     def __init__(self,
                  endpoint: Any,
                  packer: Any = None,
-                 timeout: float = 1.0) -> None:
+                 poll_timeout: float = 0.5,
+                 logger: Any = None) -> None:
         self.endpoint = endpoint
-        self.timeout = timeout
+        self.poll_timeout = poll_timeout
+        self.logger = logger
         self.incoming = asyncio.Queue()
         if packer is None:
-            packer = AsyncioTransportPacker()
+            packer = AsyncioTransportPackerRobust()
         self.packer = packer
+        self._server = None
+
+    def _log(self, message: str) -> None:
+        if self.logger is not None:
+            self.logger.debug(message)
 
     async def start(self) -> None:
+        """Bind and serve until :py:meth:`stop` closes the listener."""
+        if self._server is not None:
+            return
         host, port = self.endpoint
-        while True:
-            server = await asyncio.start_server(self._server, host, port)
-            await server.serve_forever()
+        self._server = await asyncio.start_server(self._serve_connection,
+                                                  host, port)
+        # Report what was actually bound, so a port of 0 can be used.
+        self.endpoint = self._server.sockets[0].getsockname()[:2]
+        try:
+            await self._server.serve_forever()
+        except asyncio.CancelledError:
+            pass
 
-    async def _server(self, reader: asyncio.StreamReader,
-                      writer: asyncio.StreamWriter) -> None:
-        # create a Transport context to be passed around as needed
-        ctx = SimpleNamespace(inbox=asyncio.Queue(), outbox=asyncio.Queue(),
-                              ev_quit=asyncio.Event())
-        t1 = asyncio.create_task(self._service_recv(reader, ctx))
-        t2 = asyncio.create_task(self._service_send(writer, ctx))
-
-        await t1
-        await t2
-
-    async def _service_recv(self, reader: asyncio.StreamReader,
-                            ctx: SimpleNamespace) -> None:
-        while not ctx.ev_quit.is_set():
-            # service incoming
+    async def stop(self) -> None:
+        """Stop accepting connections and release the listening socket."""
+        server, self._server = self._server, None
+        if server is not None:
+            server.close()
             try:
-                recv_data = await self.packer.recv(reader)
-            except ConnectionError:
-                recv_data = b''
-                ctx.ev_quit.set()
+                await server.wait_closed()
+            except Exception:
+                pass
 
-            if len(recv_data) > 0:
-                await ctx.inbox.put(recv_data)
-                await self.incoming.put(ctx)
-
-    async def _service_send(self, writer: asyncio.StreamWriter,
-                            ctx: SimpleNamespace) -> None:
-        while not ctx.ev_quit.is_set():
-            # service outgoing
-            send_data = await ctx.outbox.get()
-            await self.packer.send(writer, send_data)
+    async def _serve_connection(self, reader: asyncio.StreamReader,
+                                writer: asyncio.StreamWriter) -> None:
+        """Read requests off one connection for as long as it lasts."""
+        peer = writer.get_extra_info('peername')
+        ctx = SimpleNamespace(writer=writer, client_address=peer,
+                              send_lock=asyncio.Lock(),
+                              # A bare socket carries no credentials.
+                              auth=None)
+        try:
+            while True:
+                message = await self.packer.recv(reader)
+                if not message:
+                    break
+                await self.incoming.put((ctx, message))
+        except (ConnectionError, asyncio.IncompleteReadError) as e:
+            self._log('connection from %s ended: %s' % (peer, e))
+        finally:
+            writer.close()
 
     async def receive_message(self) -> Tuple[SimpleNamespace, bytes]:
-        ctx = await self.incoming.get()
-        msg = await ctx.inbox.get()
-        return ctx, msg
+        """Return the next ``(context, message)`` pair.
+
+        :raises TransportTimeout: when nothing arrived within
+            ``poll_timeout``.
+        """
+        try:
+            return await asyncio.wait_for(self.incoming.get(),
+                                          timeout=self.poll_timeout)
+        except asyncio.TimeoutError:
+            raise TransportTimeout() from None
 
     async def send_reply(self, ctx: SimpleNamespace, reply: bytes) -> None:
-        await ctx.outbox.put(reply)
+        """Write a reply back on the connection it came from."""
+        try:
+            async with ctx.send_lock:
+                await self.packer.send(ctx.writer, reply)
+        except Exception as e:
+            self._log('could not reply to %s: %s' % (ctx.client_address, e))
 
     @classmethod
-    def create(cls, endpoint: tuple[str, int], backlog: int = 0) \
-              -> 'AsyncioTcpServerTransport':
-        """Create new server transport.
+    def create(cls, endpoint: tuple[str, int], backlog: int = 64,
+               packer: Any = None,
+               **kwargs: Any) -> 'AsyncioTcpServerTransport':
+        """Create a new server transport.
 
-        Instead of creating the server yourself, you can call this function
-        with the (host, port) endpoint.
+        Note that it does not bind until :py:meth:`start` is awaited, since
+        binding is itself a coroutine.
 
         :param endpoint: The endpoint clients will connect to.
-        :param backlog: The number of pending connections to allow.
+        :param backlog: Accepted for symmetry with the other transports;
+            asyncio manages the accept queue itself.
         """
-        return cls(endpoint)
+        return cls(endpoint, packer=packer, **kwargs)
 
 
 class AsyncioTransportPacker:
-    """This version of the transport packer does no size check and is
-    limited to sending and receiving packets of `chunk_size`.
+    """Unframed: reads one chunk of at most `chunk_size` bytes.
+
+    .. warning::
+
+        A message larger than a chunk arrives truncated, and two smaller ones
+        can arrive as one, because nothing says where a message ends.  Prefer
+        :py:class:`AsyncioTransportPackerRobust`, which both asyncio
+        transports use by default.  This is kept for a peer that speaks the
+        old unframed format.
     """
 
-    def __init__(self):
+    def __init__(self) -> None:
         self.version = b'1.0'
         self.chunk_size = 4096
 
@@ -811,17 +860,55 @@ class AsyncioTransportPacker:
 
     async def send(self, writer: asyncio.StreamWriter,
                    msg: bytes) -> None:
-        #print("writer writing")
         writer.write(msg)
         await writer.drain()
-        #print("writer wrote message")
 
     async def recv(self, reader: asyncio.StreamReader) -> bytes:
-        # read msg body from socket, fixed size
-        #print("reader reading")
-        msg = await reader.read(n=self.chunk_size)
-        num_recvd = len(msg)
-        if num_recvd == 0:
+        msg = await reader.read(self.chunk_size)
+        if len(msg) == 0:
             raise ConnectionError("no bytes received")
-        #print(f"reader got message {num_recvd} bytes")
         return msg
+
+
+class AsyncioTransportPackerRobust(AsyncioTransportPacker):
+    """Length-prefixed, so a message of any size arrives whole.
+
+    The same framing as :py:class:`TransportPackerRobust`, so the asyncio and
+    threaded transports are interchangeable on the wire.
+    """
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.version = b'1.0'
+        self.rpc_hdr_len = 32
+
+    def pack(self, msg: bytes) -> bytes:
+        hdr = b'%s,%d' % (self.version, len(msg))
+        hdr += b' ' * (self.rpc_hdr_len - len(hdr))
+        if len(hdr) != self.rpc_hdr_len:
+            raise ValueError("RPC header len actual(%d) != expected(%d)" % (
+                len(hdr), self.rpc_hdr_len))
+        return hdr + msg
+
+    async def send(self, writer: asyncio.StreamWriter,
+                   msg: bytes) -> None:
+        writer.write(self.pack(msg))
+        await writer.drain()
+
+    async def recv(self, reader: asyncio.StreamReader) -> bytes:
+        try:
+            hdr = await reader.readexactly(self.rpc_hdr_len)
+        except asyncio.IncompleteReadError:
+            raise ConnectionError("no bytes received") from None
+
+        tup = hdr.strip().split(b',')
+        if len(tup) != 2:
+            raise ValueError(
+                "RPC header: num fields(%d) != expected(%d) [hdr:%s]"
+                % (len(tup), 2, hdr))
+        _ver, body_size = tup
+
+        try:
+            return await reader.readexactly(int(body_size))
+        except asyncio.IncompleteReadError:
+            raise ConnectionError("truncated message body") from None
