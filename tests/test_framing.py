@@ -26,21 +26,19 @@ def test_an_unsecured_message_is_header_plus_body():
     assert len(wrapped) == framing.HEADER_LEN + len(BODY)
     assert wrapped.endswith(BODY), "the body should be carried verbatim"
 
-    payload, meta = f.unwrap(wrapped)
-    assert payload == BODY
-    assert meta['flags'] == 0
+    got = f.unwrap(wrapped)
+    assert got.payload == BODY
+    assert got.flags == 0
 
 
 def test_the_serializer_is_recorded():
     f = Framing(serializer_id=3)
-    _payload, meta = f.unwrap(f.wrap(BODY))
-    assert meta['serializer_id'] == 3
+    assert f.unwrap(f.wrap(BODY)).serializer_id == 3
 
 
 def test_an_empty_body_round_trips():
     f = Framing()
-    payload, _meta = f.unwrap(f.wrap(b''))
-    assert payload == b''
+    assert f.unwrap(f.wrap(b'')).payload == b''
 
 
 # ------------------------------------------------------------ layers --
@@ -50,21 +48,21 @@ def test_compression_round_trips():
     payload = b'x' * 10000
     wrapped = f.wrap(payload)
     assert len(wrapped) < len(payload), "it should actually be smaller"
-    assert f.unwrap(wrapped)[0] == payload
+    assert f.unwrap(wrapped).payload == payload
 
 
 def test_a_short_payload_is_not_actually_compressed():
     """Compressing a short message usually makes it longer, so it is stored
     instead -- and must still come back."""
     f = Framing(layers=[Deflate(threshold=1000)])
-    assert f.unwrap(f.wrap(b'hi'))[0] == b'hi'
+    assert f.unwrap(f.wrap(b'hi')).payload == b'hi'
 
 
 def test_signing_round_trips():
     f = Framing(layers=[Signature(KEY)])
-    payload, meta = f.unwrap(f.wrap(BODY))
-    assert payload == BODY
-    assert meta['flags'] & FLAG_SIGNED
+    got = f.unwrap(f.wrap(BODY))
+    assert got.payload == BODY
+    assert got.flags & FLAG_SIGNED
 
 
 def test_a_tampered_body_is_refused():
@@ -104,7 +102,7 @@ def test_encryption_round_trips():
     f = Framing(layers=[Encrypt(KEY)])
     wrapped = f.wrap(BODY)
     assert BODY not in wrapped, "the plaintext should not be on the wire"
-    assert f.unwrap(wrapped)[0] == BODY
+    assert f.unwrap(wrapped).payload == BODY
 
 
 def test_encryption_uses_a_fresh_nonce():
@@ -140,7 +138,7 @@ def test_compress_then_encrypt_then_sign():
     f = Framing(layers=layers)
     payload = b'y' * 20000
     wrapped = f.wrap(payload)
-    assert f.unwrap(wrapped)[0] == payload
+    assert f.unwrap(wrapped).payload == payload
     assert len(wrapped) < len(payload), "compression should still have run"
 
 
@@ -150,7 +148,7 @@ def test_the_order_is_reversed_on_the_way_in():
     layers = [Deflate(), Signature(KEY)]
     sender = Framing(layers=layers)
     receiver = Framing(layers=[Deflate(), Signature(KEY)])
-    assert receiver.unwrap(sender.wrap(BODY))[0] == BODY
+    assert receiver.unwrap(sender.wrap(BODY)).payload == BODY
 
 
 # ------------------------------------------------------------- policy --
@@ -182,7 +180,7 @@ def test_requiring_what_you_cannot_do_is_refused_at_construction():
 
 def test_a_receiver_that_requires_nothing_still_accepts_protection():
     lax = Framing(layers=[Signature(KEY)])
-    assert lax.unwrap(Framing(layers=[Signature(KEY)]).wrap(BODY))[0] == BODY
+    assert lax.unwrap(Framing(layers=[Signature(KEY)]).wrap(BODY)).payload == BODY
 
 
 # -------------------------------------------------------- credentials --
@@ -190,18 +188,18 @@ def test_a_receiver_that_requires_nothing_still_accepts_protection():
 def test_credentials_are_carried_and_read_back():
     f = Framing()
     creds = Credentials('bob', 'sekrit')
-    _payload, meta = f.unwrap(f.wrap(BODY, credentials=creds.encode()))
+    got = f.unwrap(f.wrap(BODY, credentials=creds.encode()))
 
-    assert meta['flags'] & FLAG_CREDENTIALS
-    assert Credentials.decode(meta['credentials']) == creds
+    assert got.flags & FLAG_CREDENTIALS
+    assert got.credentials() == creds
 
 
 def test_credentials_survive_the_other_layers():
     f = Framing(layers=[Deflate(), Encrypt(KEY), Signature(KEY)])
     creds = Credentials('bob', 'sekrit')
-    payload, meta = f.unwrap(f.wrap(BODY, credentials=creds.encode()))
-    assert payload == BODY
-    assert Credentials.decode(meta['credentials']).username == 'bob'
+    got = f.unwrap(f.wrap(BODY, credentials=creds.encode()))
+    assert got.payload == BODY
+    assert got.credentials().username == 'bob'
 
 
 def test_credentials_with_awkward_characters():
@@ -216,7 +214,7 @@ def test_a_receiver_can_require_credentials():
 
     ok = strict.unwrap(Framing().wrap(BODY,
                                       credentials=Credentials('a', 'b').encode()))
-    assert ok[0] == BODY
+    assert ok.payload == BODY
 
 
 # ------------------------------------------------------ malformed input --
@@ -253,3 +251,79 @@ def test_a_truncated_section():
     wrapped = f.wrap(BODY, credentials=b'user\x00pass')
     with pytest.raises(FramingError):
         f.unwrap(wrapped[:framing.HEADER_LEN + 1])
+
+
+# ------------------------------------------- proven apart from claimed --
+
+def test_credentials_alone_prove_nothing():
+    """The distinction the split exists for: a sender saying who it is does
+    not make it so."""
+    f = Framing()
+    got = f.unwrap(f.wrap(BODY, credentials=Credentials('bob', 'x').encode()))
+
+    assert got.claimed_credentials is not None, "the claim is carried"
+    assert got.principal is None, "but nothing has checked it"
+    assert not got.is_authenticated
+
+
+def test_a_verified_signature_names_a_principal():
+    f = Framing(layers=[Signature(KEY, principal='gen2-internal')])
+    got = f.unwrap(f.wrap(BODY))
+
+    assert got.principal == 'gen2-internal'
+    assert got.is_authenticated
+    assert got.claimed_credentials is None
+
+
+def test_a_forged_message_never_yields_a_principal():
+    """A failed signature raises, so no caller ever sees a principal from a
+    message that did not verify."""
+    sender = Framing(layers=[Signature(b'wrong key' + b'-' * 23)])
+    receiver = Framing(layers=[Signature(KEY, principal='gen2-internal')])
+    with pytest.raises(FramingError):
+        receiver.unwrap(sender.wrap(BODY))
+
+
+def test_a_sender_cannot_assert_a_principal_through_credentials():
+    """Credentials are sender-controlled; principal is not.  Putting a name
+    in the credentials must not make it a proven identity."""
+    f = Framing()
+    got = f.unwrap(f.wrap(BODY,
+                          credentials=Credentials('root', 'hunter2').encode()))
+    assert got.principal is None
+    assert not got.is_authenticated
+
+
+def test_signing_without_a_principal_still_verifies():
+    """A shared key with no name attached still proves possession; it just
+    has no identity to report."""
+    f = Framing(layers=[Signature(KEY)])
+    got = f.unwrap(f.wrap(BODY))
+    assert got.payload == BODY
+    assert got.principal is None
+
+
+def test_encryption_reports_no_principal():
+    """The box is authenticated, but with a shared key that says nothing
+    about which holder sent it -- so identity stays with Signature."""
+    f = Framing(layers=[Encrypt(KEY)])
+    got = f.unwrap(f.wrap(BODY))
+    assert got.payload == BODY
+    assert got.principal is None
+
+
+def test_signed_and_credentialed_together():
+    """Both may be present, and they still mean different things."""
+    f = Framing(layers=[Signature(KEY, principal='gen2-internal')])
+    got = f.unwrap(f.wrap(BODY,
+                          credentials=Credentials('bob', 'x').encode()))
+    assert got.principal == 'gen2-internal'
+    assert got.credentials().username == 'bob'
+
+
+def test_the_repr_does_not_leak_the_secret():
+    f = Framing()
+    got = f.unwrap(f.wrap(BODY,
+                          credentials=Credentials('bob', 'hunter2').encode()))
+    assert 'hunter2' not in repr(got)
+    assert 'bob' not in repr(got)

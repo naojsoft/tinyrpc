@@ -78,6 +78,69 @@ class PolicyError(FramingError):
     """
 
 
+class Unwrapped:
+    """What came out of an envelope, and how much of it can be believed.
+
+    The distinction this draws is the point of the class.  A signature that
+    verified is *proof*: the framing checked it, and a message that failed
+    never got this far.  Credentials are only ever a *claim* -- the sender
+    said who it was, and nothing here has tested that.  Handing both to a
+    caller as "auth" invites treating the second like the first, so they are
+    named apart and only a layer can set :py:attr:`principal`.
+
+    .. py:attribute:: payload
+
+        The message, with every layer undone.
+
+    .. py:attribute:: principal
+
+        Who the sender is *proven* to be, or ``None``.  Set only by a layer
+        that verified it; nothing a sender writes can reach this.
+
+    .. py:attribute:: claimed_credentials
+
+        What the sender asserted about itself, unverified, or ``None``.
+        Whoever reads this is responsible for checking it.
+    """
+
+    __slots__ = ('payload', 'serializer_id', 'flags', 'principal',
+                 'claimed_credentials', 'sections')
+
+    def __init__(self, payload: bytes, serializer_id: int, flags: int,
+                 sections: Dict[str, bytes]) -> None:
+        self.payload = payload
+        self.serializer_id = serializer_id
+        self.flags = flags
+        self.sections = sections
+        self.principal = None
+        self.claimed_credentials = sections.get('credentials')
+
+    @property
+    def is_authenticated(self) -> bool:
+        """Whether a layer proved who sent this.
+
+        Carrying credentials does not make this true: they have not been
+        checked by anything here.
+        """
+        return self.principal is not None
+
+    def credentials(self) -> Optional['Any']:
+        """Decode the claimed credentials, or ``None`` if there were none.
+
+        Still a claim.  Checking it is the caller's job.
+        """
+        if self.claimed_credentials is None:
+            return None
+        from .layers import Credentials
+        return Credentials.decode(self.claimed_credentials)
+
+    def __repr__(self) -> str:
+        # Deliberately says nothing about what the credentials contain.
+        return ('<Unwrapped %d bytes principal=%r claims_credentials=%s>'
+                % (len(self.payload), self.principal,
+                   self.claimed_credentials is not None))
+
+
 class Layer:
     """Something applied to a message's bytes on the way out and undone on
     the way in.
@@ -102,9 +165,14 @@ class Layer:
         """
         raise NotImplementedError
 
-    def remove(self, payload: bytes,
-               sections: Dict[str, bytes]) -> bytes:
-        """Undo :py:meth:`apply` on incoming bytes."""
+    def remove(self, payload: bytes, sections: Dict[str, bytes],
+               result: 'Unwrapped') -> bytes:
+        """Undo :py:meth:`apply` on incoming bytes.
+
+        A layer that *proves* who sent the message sets
+        ``result.principal``.  It is passed the result rather than keeping
+        state of its own because one instance serves every thread.
+        """
         raise NotImplementedError
 
 
@@ -176,12 +244,11 @@ class Framing:
 
     # ------------------------------------------------------------ incoming --
 
-    def unwrap(self, data: bytes) -> Tuple[bytes, Dict[str, Any]]:
+    def unwrap(self, data: bytes) -> 'Unwrapped':
         """Unframe a received message.
 
-        :return: ``(payload, meta)``.  ``meta`` carries ``serializer_id`` and
-            whichever sections were present, so a caller can read the
-            credentials without knowing how the message was framed.
+        :return: an :py:class:`Unwrapped`, which keeps what was *proven*
+            about the sender apart from what was merely *claimed*.
         :raises FramingError: if it cannot be read.
         :raises PolicyError: if it does not carry what this end requires.
         """
@@ -223,16 +290,16 @@ class Framing:
             raise FramingError('body length %d does not match header %d'
                                % (len(payload), length))
 
+        result = Unwrapped(payload, serializer_id, flags, sections)
+
         if flags & ~FLAG_CREDENTIALS:
             for layer in reversed(self.layers):
                 if layer.flag and not flags & layer.flag:
                     continue
-                payload = layer.remove(payload, sections)
+                payload = layer.remove(payload, sections, result)
+            result.payload = payload
 
-        meta = dict(sections)
-        meta['serializer_id'] = serializer_id
-        meta['flags'] = flags
-        return payload, meta
+        return result
 
     def __repr__(self) -> str:
         names = ', '.join(type(la).__name__ for la in self.layers) or 'none'

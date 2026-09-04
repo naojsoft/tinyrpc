@@ -56,7 +56,8 @@ class Deflate(Layer):
             return zlib.compress(payload, 0), None
         return zlib.compress(payload, self.level), None
 
-    def remove(self, payload: bytes, sections: Dict[str, bytes]) -> bytes:
+    def remove(self, payload: bytes, sections: Dict[str, bytes],
+               result: Any) -> bytes:
         try:
             return zlib.decompress(payload)
         except zlib.error as e:
@@ -75,6 +76,12 @@ class Signature(Layer):
     :param max_age: Seconds a message stays acceptable, or ``None`` to not
         check.  Rejecting old messages is what makes replay expensive; it
         needs the two clocks within roughly this much of each other.
+    :param principal: What a verified message proves the sender to be.  With
+        one shared key that is only as specific as the key is: everyone
+        holding it can sign as this principal, so name the key's realm --
+        "gen2-internal" -- rather than any one service.  Per-service
+        identity needs a key per service, and the key's name covered by the
+        signature so it cannot be swapped.
     """
 
     flag = FLAG_SIGNED
@@ -84,12 +91,14 @@ class Signature(Layer):
     _STAMP_LEN = struct.calcsize(_STAMP)
 
     def __init__(self, key: bytes, digest: str = 'sha256',
-                 max_age: Optional[float] = 300.0) -> None:
+                 max_age: Optional[float] = 300.0,
+                 principal: Optional[str] = None) -> None:
         if not key:
             raise ValueError('a signing key is required')
         self.key = key if isinstance(key, bytes) else key.encode('utf-8')
         self.digest = digest
         self.max_age = max_age
+        self.principal = principal
 
     def _mac(self, stamp: bytes, payload: bytes) -> bytes:
         return hmac.new(self.key, stamp + payload, self.digest).digest()
@@ -98,7 +107,8 @@ class Signature(Layer):
         stamp = struct.pack(self._STAMP, time.time(), os.urandom(8))
         return payload, stamp + self._mac(stamp, payload)
 
-    def remove(self, payload: bytes, sections: Dict[str, bytes]) -> bytes:
+    def remove(self, payload: bytes, sections: Dict[str, bytes],
+               result: Any) -> bytes:
         blob = sections.get('signature')
         if not blob or len(blob) <= self._STAMP_LEN:
             raise FramingError('message is not signed')
@@ -114,6 +124,11 @@ class Signature(Layer):
                 raise FramingError(
                     'message is %.0fs old, older than the %.0fs allowed'
                     % (age, self.max_age))
+
+        # Only now, with the signature checked and the message fresh, is
+        # there anything proven to report.
+        if self.principal is not None:
+            result.principal = self.principal
         return payload
 
 
@@ -127,6 +142,11 @@ class Encrypt(Layer):
     Note this authenticates the *message*, not the sender: anyone holding the
     key can produce a valid box.  With one key per pair of peers that is a
     useful statement; with one key shared by everyone it is not.
+
+    It therefore reports no principal, even though the box is authenticated.
+    Confidentiality and identity are separate questions, and keeping the
+    answer to the second in one place -- :py:class:`Signature` -- means there
+    is never a doubt about which layer decided who the caller is.
     """
 
     flag = FLAG_ENCRYPTED
@@ -150,7 +170,8 @@ class Encrypt(Layer):
         nonce = os.urandom(self._nonce_size)
         return self._box.encrypt(payload, nonce).ciphertext, nonce
 
-    def remove(self, payload: bytes, sections: Dict[str, bytes]) -> bytes:
+    def remove(self, payload: bytes, sections: Dict[str, bytes],
+               result: Any) -> bytes:
         nonce = sections.get('nonce')
         if not nonce:
             raise FramingError('encrypted message carries no nonce')
