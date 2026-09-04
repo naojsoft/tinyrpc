@@ -5,8 +5,9 @@ from __future__ import absolute_import  # needed for zmq import
 
 from typing import Tuple, Any, Dict
 
+import queue as _queue
+import socket as _socket
 import threading
-import time
 
 import zmq
 
@@ -21,82 +22,119 @@ class ZmqServerTransport(ServerTransport):
                    endpoint.
     """
 
-    #: How long a single poll waits before the lock is released so that
-    #: anything else wanting the socket can have a turn.
-    POLL_SLICE_MS = 50
-
     def __init__(self, socket: zmq.Socket,
                  poll_timeout: float = 0.5) -> None:
         self.socket = socket
         self.poll_timeout = poll_timeout
         self.endpoint = None
 
-        # A 0mq socket must not be touched by two threads at once, and three
-        # of them want this one: the server loop polling and receiving, the
-        # worker threads sending replies, and whoever calls stop().  Using it
-        # unguarded does not merely interleave badly -- it segfaults.
-        self._lock = threading.RLock()
-        self._closed = False
+        # A 0mq socket must not be touched by more than one thread, and three
+        # would like to: the server loop receiving, the worker threads
+        # replying, and whoever calls stop().  Rather than serialise them --
+        # which works but lets the receive loop starve the senders, since it
+        # reacquires the moment it lets go -- one thread owns the socket and
+        # the others hand it work.
+        #
+        # A socketpair is the wakeup: it has a file descriptor, so the same
+        # poll can wait on it and on the 0mq socket at once, and writing to
+        # it from another thread is safe.  That means no busy polling and no
+        # added latency on a reply.
+        self._incoming = _queue.Queue()
+        self._outgoing = _queue.Queue()
+        self._wake_r, self._wake_w = _socket.socketpair()
+        self._ev_quit = threading.Event()
+        self._thread = None
+        self._lifecycle = threading.Lock()
 
     def start(self) -> None:
-        """Nothing to start: the socket is already bound and listening."""
+        """Start the thread that owns the socket."""
+        with self._lifecycle:
+            if self._thread is not None:
+                return
+            self._thread = threading.Thread(target=self._serve_socket,
+                                            name='zmq-transport')
+            self._thread.daemon = True
+            self._thread.start()
 
     def stop(self) -> None:
-        """Close the socket.
+        """Ask the socket thread to finish, and wait for it to close up."""
+        self._ev_quit.set()
+        try:
+            self._wake_w.send(b'\x01')
+        except Exception:
+            pass
 
-        Taken under the same lock as everything else, so this waits for a
-        poll or a send in progress rather than pulling the socket out from
-        under it.
-        """
-        with self._lock:
-            if self._closed:
-                return
-            self._closed = True
+        with self._lifecycle:
+            thread, self._thread = self._thread, None
+        if thread is not None:
+            thread.join(timeout=5.0)
+        else:
+            # Never started, so nobody else will close the socket.
+            self._close()
+
+    def _close(self):
+        for handle in (self.socket, self._wake_r, self._wake_w):
             try:
-                self.socket.close(linger=0)
+                handle.close()
             except Exception:
                 pass
+
+    def _serve_socket(self):
+        """Own the socket: receive requests, and send the replies queued."""
+        poller = zmq.Poller()
+        poller.register(self.socket, zmq.POLLIN)
+        poller.register(self._wake_r, zmq.POLLIN)
+        try:
+            while not self._ev_quit.is_set():
+                events = dict(poller.poll(500))
+
+                if events.get(self._wake_r):
+                    try:
+                        self._wake_r.recv(4096)
+                    except Exception:
+                        pass
+
+                while True:
+                    try:
+                        context, reply = self._outgoing.get_nowait()
+                    except _queue.Empty:
+                        break
+                    try:
+                        self.socket.send_multipart(context + [reply])
+                    except Exception:
+                        pass
+
+                if events.get(self.socket) == zmq.POLLIN:
+                    try:
+                        msg = self.socket.recv_multipart()
+                    except Exception:
+                        break
+                    self._incoming.put((msg[:-1], msg[-1]))
+        finally:
+            self._close()
 
     def receive_message(self) -> Tuple[Any, bytes]:
         """Return the next ``(context, message)`` pair.
 
         :raises TransportTimeout: when nothing arrived within
-            ``poll_timeout``.  Without this the server loop would sit in
-            ``recv_multipart`` and not notice it had been asked to stop until
-            the next request happened to arrive.
-
-        The wait is made of short slices rather than one long poll, so that a
-        worker with a reply to send is not kept waiting for the socket for
-        the whole interval.
+            ``poll_timeout``.  Without this the server loop would sit waiting
+            and not notice it had been asked to stop until the next request
+            happened to arrive.
         """
-        deadline = None
-        if self.poll_timeout is not None:
-            deadline = time.monotonic() + self.poll_timeout
-
-        while True:
-            with self._lock:
-                if self._closed:
-                    raise TransportTimeout()
-
-                remaining_ms = self.POLL_SLICE_MS
-                if deadline is not None:
-                    left = (deadline - time.monotonic()) * 1000
-                    if left <= 0:
-                        raise TransportTimeout()
-                    remaining_ms = min(self.POLL_SLICE_MS, int(left) or 1)
-
-                if self.socket.poll(remaining_ms, zmq.POLLIN):
-                    msg = self.socket.recv_multipart()
-                    return msg[:-1], msg[-1]
-
-            if deadline is None:
-                continue
+        if self._thread is None and not self._ev_quit.is_set():
+            self.start()
+        try:
+            return self._incoming.get(timeout=self.poll_timeout)
+        except _queue.Empty:
+            raise TransportTimeout()
 
     def send_reply(self, context: Any, reply: bytes) -> None:
-        with self._lock:
-            if self._closed:
-                return
-            self.socket.send_multipart(context + [reply])
+        """Hand a reply to the thread that owns the socket."""
+        self._outgoing.put((context, reply))
+        try:
+            self._wake_w.send(b'\x01')
+        except Exception:
+            pass
 
     @classmethod
     def create(cls, zmq_context: zmq.Context, endpoint: str,
