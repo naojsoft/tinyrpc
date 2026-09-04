@@ -97,6 +97,14 @@ class Unwrapped:
         Who the sender is *proven* to be, or ``None``.  Set only by a layer
         that verified it; nothing a sender writes can reach this.
 
+    .. py:attribute:: signed_as
+
+        The id of the key that actually verified, or ``None``.  Where
+        several keys map to one principal -- a rotation, an alias -- this
+        says which was used, which is what a revocation or an audit trail
+        needs.  It is also what to sign a reply with, so an answer goes back
+        under the key the caller demonstrably holds.
+
     .. py:attribute:: claimed_credentials
 
         What the sender asserted about itself, unverified, or ``None``.
@@ -111,7 +119,7 @@ class Unwrapped:
     """
 
     __slots__ = ('payload', 'serializer_id', 'protocol_id', 'flags',
-                 'principal', 'claimed_credentials', 'sections')
+                 'principal', 'signed_as', 'claimed_credentials', 'sections')
 
     def __init__(self, payload: bytes, serializer_id: int, protocol_id: int,
                  flags: int, sections: Dict[str, bytes]) -> None:
@@ -121,6 +129,7 @@ class Unwrapped:
         self.flags = flags
         self.sections = sections
         self.principal = None
+        self.signed_as = None
         self.claimed_credentials = sections.get('credentials')
 
     @property
@@ -165,9 +174,14 @@ class Layer:
     #: :py:data:`SECTION_ORDER`.
     section = None
 
-    def apply(self, payload: bytes) -> Tuple[bytes, Optional[bytes]]:
+    def apply(self, payload: bytes,
+              sign_as: Optional[bytes] = None) -> Tuple[bytes,
+                                                        Optional[bytes]]:
         """Transform outgoing bytes.
 
+        :param sign_as: Which identity to sign as, when the caller wants a
+            particular one rather than this end's default.  Layers that do
+            not sign ignore it.
         :return: ``(payload, section)`` where ``section`` is the bytes to
             carry in this layer's header section, or ``None``.
         """
@@ -228,11 +242,16 @@ class Framing:
 
     def wrap(self, payload: bytes,
              credentials: Optional[bytes] = None,
-             serializer_id: Optional[int] = None) -> bytes:
+             serializer_id: Optional[int] = None,
+             sign_as: Optional[bytes] = None) -> bytes:
         """Frame a payload for sending.
 
         :param serializer_id: Overrides the default for this message, so a
             server can answer in the encoding it was addressed in.
+        :param sign_as: Overrides which key signs this message, so a server
+            can answer under the key the caller used -- one it is known to
+            hold, which spares both ends having to agree in advance on which
+            of several the reply would carry.
         """
         flags = self._flags
         sections: Dict[str, bytes] = {}
@@ -243,7 +262,7 @@ class Framing:
 
         if not self._plain:
             for layer in self.layers:
-                payload, section = layer.apply(payload)
+                payload, section = layer.apply(payload, sign_as)
                 if section is not None:
                     sections[layer.section] = section
 

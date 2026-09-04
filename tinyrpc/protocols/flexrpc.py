@@ -136,7 +136,8 @@ class _Message:
         return self._protocol.framing.wrap(
             serializer.dumps(body),
             credentials=self._credentials,
-            serializer_id=self.serializer_id)
+            serializer_id=self.serializer_id,
+            sign_as=self.sign_as)
 
 
 class FlexRPCRequest(_Message, RPCRequest):
@@ -151,6 +152,29 @@ class FlexRPCRequest(_Message, RPCRequest):
 
         What the sender *claimed* to be, unverified, or ``None``.  A server
         that trusts this without checking it has authenticated nobody.
+
+    .. py:attribute:: signed_as
+
+        The id of the key that verified this request, or ``None``.  Where
+        several keys map to one principal -- a rotation, an alias -- this
+        says which was actually used.
+
+    .. py:attribute:: sign_as
+
+        Which key to sign the reply with, or ``None`` for this end's own.
+
+        Left alone, a reply is signed by the service, which is what makes
+        ``reply.principal`` mean "this came from the service" -- and with
+        public keys, where only the service can produce that signature, it
+        genuinely does.
+
+        Setting it to ``signed_as`` answers under the caller's key instead.
+        That is right only where the key is a secret both ends already
+        share, because there it names the secret rather than the sender; it
+        lets a caller holding just its own key check the reply.  With keys
+        that identify senders it is either impossible -- the service does
+        not hold the caller's private key -- or a lie about who answered,
+        so it is never done automatically.
     """
 
     def __init__(self, protocol: 'FlexRPCProtocol',
@@ -163,6 +187,8 @@ class FlexRPCRequest(_Message, RPCRequest):
         self._credentials = protocol._credentials
         self.principal: Optional[str] = None
         self.credentials: Optional[Credentials] = None
+        self.signed_as: Optional[str] = None
+        self.sign_as: Optional[str] = None
 
     def serialize(self) -> bytes:
         return self._framed({
@@ -181,6 +207,7 @@ class FlexRPCRequest(_Message, RPCRequest):
         response = FlexRPCResponse(self._protocol, self.serializer_id)
         response.unique_id = self.unique_id
         response.result = result
+        response.sign_as = self.sign_as
         return response
 
     def error_respond(self, error: Any) -> Optional['FlexRPCErrorResponse']:
@@ -191,6 +218,7 @@ class FlexRPCRequest(_Message, RPCRequest):
         response = FlexRPCErrorResponse(self._protocol, self.serializer_id)
         response.unique_id = self.unique_id
         response.code, response.error, response.data = _code_and_message(error)
+        response.sign_as = self.sign_as
         return response
 
 
@@ -208,6 +236,7 @@ class FlexRPCResponse(_Message, RPCResponse):
         # a password would be the caller's, and has no business coming back.
         self._credentials = None
         self.principal: Optional[str] = None
+        self.sign_as: Optional[str] = None
 
     def serialize(self) -> bytes:
         return self._framed({
@@ -231,6 +260,7 @@ class FlexRPCErrorResponse(_Message, RPCErrorResponse):
                               else serializer_id)
         self._credentials = None
         self.principal: Optional[str] = None
+        self.sign_as: Optional[str] = None
 
     def serialize(self) -> bytes:
         error: Dict[str, Any] = {'code': self.code, 'message': self.error}
@@ -371,6 +401,7 @@ class FlexRPCProtocol(RPCProtocol):
         # Proven and claimed, kept apart all the way to the authenticator.
         request.principal = got.principal
         request.credentials = got.credentials()
+        request.signed_as = got.signed_as
         # A request built here inherits this protocol's outgoing
         # credentials, which is right for a call we are making and wrong for
         # one we merely received.  A service that re-serializes an arrived

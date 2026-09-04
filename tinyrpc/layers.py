@@ -58,7 +58,9 @@ class Deflate(Layer):
         self.level = level
         self.threshold = threshold
 
-    def apply(self, payload: bytes) -> Tuple[bytes, Optional[bytes]]:
+    def apply(self, payload: bytes,
+              sign_as: Optional[bytes] = None) -> Tuple[bytes,
+                                                        Optional[bytes]]:
         if len(payload) < self.threshold:
             return zlib.compress(payload, 0), None
         return zlib.compress(payload, self.level), None
@@ -262,14 +264,26 @@ class Signature(Layer):
 
     # -------------------------------------------------------------------
 
-    def apply(self, payload: bytes) -> Tuple[bytes, Optional[bytes]]:
-        if self._sign_key is None:
+    def apply(self, payload: bytes,
+              sign_as: Optional[bytes] = None) -> Tuple[bytes,
+                                                        Optional[bytes]]:
+        if sign_as is None:
+            key_id, key = self._sign_as, self._sign_key
+        else:
+            key_id = _as_bytes(sign_as)
+            key = self._keys.get(key_id)
+            if key is None:
+                raise FramingError('asked to sign as %r, which this end has '
+                                   'no key for'
+                                   % (key_id.decode('utf-8', 'replace'),))
+        if key is None:
             raise FramingError('this end holds no signing key; it can only '
                                'verify')
+
         stamp = struct.pack(self._STAMP, time.time(), os.urandom(8),
-                            len(self._sign_as), len(self._audience))
-        mac = self._make(self._sign_key, stamp, self._sign_as, payload)
-        return payload, stamp + self._sign_as + mac
+                            len(key_id), len(self._audience))
+        mac = self._make(key, stamp, key_id, payload)
+        return payload, stamp + key_id + mac
 
     def remove(self, payload: bytes, sections: Dict[str, bytes],
                result: Unwrapped) -> bytes:
@@ -317,6 +331,7 @@ class Signature(Layer):
         # Only now, with the key identified, the MAC matching and the
         # message fresh, is there anything proven to report.
         result.principal = self._principals[key_id]
+        result.signed_as = key_id.decode('utf-8', 'replace')
         return payload
 
 
@@ -456,7 +471,9 @@ class Encrypt(Layer):
         self._box = SecretBox(key)
         self._nonce_size = SecretBox.NONCE_SIZE
 
-    def apply(self, payload: bytes) -> Tuple[bytes, Optional[bytes]]:
+    def apply(self, payload: bytes,
+              sign_as: Optional[bytes] = None) -> Tuple[bytes,
+                                                        Optional[bytes]]:
         nonce = os.urandom(self._nonce_size)
         return self._box.encrypt(payload, nonce).ciphertext, nonce
 

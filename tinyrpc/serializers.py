@@ -44,24 +44,56 @@ def _json_loads(data: bytes) -> Any:
     return json.loads(data.decode('utf-8'))
 
 
+#: msgpack has no integer wider than 64 bits.  json and XML both do, so
+#: without this the choice of encoding would quietly change what a program
+#: can send -- a value that crosses as json raising OverflowError as
+#: msgpack.  Oversized integers therefore travel as an extension type
+#: holding their decimal text.
+#:
+#: The code is 42 because that is what Gen2's own packer has always used,
+#: and the same values pass through both.
+MSGPACK_EXT_BIGINT = 42
+
+
+def _msgpack_bigint(obj: Any) -> Any:
+    """Encode what msgpack itself cannot, and only that."""
+    import msgpack
+    if isinstance(obj, int):
+        return msgpack.ExtType(MSGPACK_EXT_BIGINT,
+                               str(obj).encode('ascii'))
+    raise TypeError('cannot serialize %r' % (obj,))
+
+
+def _msgpack_ext(code: int, data: bytes) -> Any:
+    import msgpack
+    if code == MSGPACK_EXT_BIGINT:
+        return int(data)
+    return msgpack.ExtType(code, data)
+
+
 def _msgpack_dumps(obj: Any) -> bytes:
     import msgpack
-    return msgpack.packb(obj, use_bin_type=True)
+    return msgpack.packb(obj, default=_msgpack_bigint, use_bin_type=True)
 
 
 def _msgpack_loads(data: bytes) -> Any:
     import msgpack
-    return msgpack.unpackb(data, raw=False)
+    return msgpack.unpackb(data, ext_hook=_msgpack_ext, raw=False)
 
 
 def _msgpack_numpy_dumps(obj: Any) -> bytes:
     import msgpack_numpy
-    return msgpack_numpy.packb(obj, use_bin_type=True)
+    # msgpack-numpy chains whatever default it is given after its own, so
+    # arrays and oversized integers both survive.
+    return msgpack_numpy.packb(obj, default=_msgpack_bigint,
+                               use_bin_type=True)
 
 
 def _msgpack_numpy_loads(data: bytes) -> Any:
     import msgpack_numpy
-    return msgpack_numpy.unpackb(data, raw=False)
+    # msgpack-numpy carries arrays as mappings and reads them with an
+    # object_hook, so the extension hook is free for oversized integers.
+    return msgpack_numpy.unpackb(data, ext_hook=_msgpack_ext, raw=False)
 
 
 #: Everything that can be asked for by name.  Note what is absent: pickle.

@@ -558,3 +558,105 @@ def test_an_id_that_does_not_fit_in_the_header():
     from tinyrpc import serializers
     with pytest.raises(ValueError):
         serializers.register('mine', 256, lambda o: b'', lambda d: None)
+
+
+# ------------------------------------------------- oversized integers --
+
+@pytest.mark.parametrize('encoding', ['json', 'msgpack'])
+def test_an_integer_too_big_for_msgpack_still_crosses(encoding):
+    """An encoding is meant to be a choice about bytes, not about what a
+    program may send.  msgpack stops at 64 bits where json does not, so
+    without help the choice would change the semantics."""
+    big = 2 ** 70
+    client = FlexRPCProtocol(encoding)
+    _request, arrived = roundtrip(client, FlexRPCProtocol('json'),
+                                  'store', ({'n': big, 'neg': -big},))
+    assert arrived.args[0] == {'n': big, 'neg': -big}
+
+
+def test_something_msgpack_genuinely_cannot_carry_is_still_an_error():
+    """The big-integer hook must not become a silent catch-all."""
+    client = FlexRPCProtocol('msgpack')
+    with pytest.raises(TypeError):
+        client.create_request('store', [object()]).serialize()
+
+
+@needs_numpy
+def test_arrays_and_oversized_integers_together():
+    import numpy as np
+    big = 2 ** 70
+    a = np.arange(6, dtype='f8')
+    client = FlexRPCProtocol('msgpack-numpy')
+    _request, arrived = roundtrip(client, FlexRPCProtocol('msgpack-numpy'),
+                                  'store', ({'a': a, 'n': big},))
+    assert np.array_equal(arrived.args[0]['a'], a)
+    assert arrived.args[0]['n'] == big
+
+
+# ------------------------------------------- answering under their key --
+
+def test_a_caller_that_holds_only_its_own_key_cannot_check_the_reply():
+    """Stated because it is the constraint that shapes the shared-secret
+    mapping: a service signs as itself, so a caller must hold the service's
+    key to verify what comes back."""
+    service = FlexRPCProtocol(framing=signed('status'))   # holds both keys
+    caller = FlexRPCProtocol(framing=Framing(
+        layers=[Signature({'taskmgr': KEY_B})]))          # holds only its own
+
+    arrived = service.parse_request(caller.create_request('echo').serialize())
+    assert arrived.principal == 'taskmgr'
+
+    with pytest.raises(InvalidReplyError) as excinfo:
+        caller.parse_reply(arrived.respond('HI').serialize())
+    assert 'status' in str(excinfo.value)
+
+
+def test_answering_under_the_caller_key_is_available_but_deliberate():
+    """Right where the key is a secret both ends share, since there it names
+    the secret and not the sender.  Never automatic, because with keys that
+    identify senders it would be a lie about who answered."""
+    service = FlexRPCProtocol(framing=signed('status'))
+    caller = FlexRPCProtocol(framing=Framing(
+        layers=[Signature({'taskmgr': KEY_B})]))
+
+    arrived = service.parse_request(caller.create_request('echo').serialize())
+    assert arrived.sign_as is None, "not done behind anyone's back"
+
+    reply = arrived.respond('HI')
+    reply.sign_as = arrived.signed_as
+    assert caller.parse_reply(reply.serialize()).result == 'HI'
+
+
+def test_an_error_reply_can_be_signed_the_same_way():
+    service = FlexRPCProtocol(framing=signed('status'))
+    caller = FlexRPCProtocol(framing=Framing(
+        layers=[Signature({'taskmgr': KEY_B})]))
+    caller.raises_errors = False
+
+    arrived = service.parse_request(caller.create_request('boom').serialize())
+    failed = arrived.error_respond(ValueError('no'))
+    failed.sign_as = arrived.signed_as
+    assert caller.parse_reply(failed.serialize()).code == ERROR_APPLICATION
+
+
+def test_the_key_that_verified_is_recorded_even_when_several_share_a_name():
+    """Two keys for one principal -- a rotation -- and it still says which
+    one was actually used, which is what revoking one needs."""
+    table = {'status-2024': (KEY, 'status'), 'status-2025': (KEY_B, 'status')}
+    service = FlexRPCProtocol(framing=Framing(
+        layers=[Signature(table, sign_as='status-2025')],
+        require=FLAG_SIGNED))
+    old = FlexRPCProtocol(framing=Framing(
+        layers=[Signature({'status-2024': (KEY, 'status')})]))
+
+    arrived = service.parse_request(old.create_request('echo').serialize())
+    assert arrived.principal == 'status'
+    assert arrived.signed_as == 'status-2024'
+
+
+def test_signing_as_a_key_this_end_does_not_hold():
+    from tinyrpc.framing import FramingError
+    f = Framing(layers=[Signature({'status': KEY})])
+    with pytest.raises(FramingError) as excinfo:
+        f.wrap(b'x', sign_as='taskmgr')
+    assert 'no key for' in str(excinfo.value)
