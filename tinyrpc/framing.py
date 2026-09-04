@@ -9,7 +9,7 @@ they share one header rather than each inventing a wrapper.
 
 The header is fixed and binary::
 
-    magic(2) version(1) flags(1) serializer(1) reserved(1) length(4)
+    magic(2) version(1) flags(1) serializer(1) protocol(1) length(4)
 
 Ten bytes, packed with :py:mod:`struct`.  The flags say which optional
 sections follow; when nothing is enabled the flags are zero, the header is
@@ -38,7 +38,7 @@ from typing import Any, Dict, Optional, Sequence, Tuple
 MAGIC = b'FX'
 VERSION = 1
 
-#: ``magic, version, flags, serializer, reserved, length``
+#: ``magic, version, flags, serializer, protocol, length``
 HEADER = '!2sBBBBI'
 HEADER_LEN = struct.calcsize(HEADER)
 
@@ -101,15 +101,23 @@ class Unwrapped:
 
         What the sender asserted about itself, unverified, or ``None``.
         Whoever reads this is responsible for checking it.
+
+    .. py:attribute:: serializer_id
+    .. py:attribute:: protocol_id
+
+        The two bytes the protocol stamped on the way out.  Read them to
+        answer in the encoding you were addressed in, and to refuse a body
+        shape you do not know before trying to read it.
     """
 
-    __slots__ = ('payload', 'serializer_id', 'flags', 'principal',
-                 'claimed_credentials', 'sections')
+    __slots__ = ('payload', 'serializer_id', 'protocol_id', 'flags',
+                 'principal', 'claimed_credentials', 'sections')
 
-    def __init__(self, payload: bytes, serializer_id: int, flags: int,
-                 sections: Dict[str, bytes]) -> None:
+    def __init__(self, payload: bytes, serializer_id: int, protocol_id: int,
+                 flags: int, sections: Dict[str, bytes]) -> None:
         self.payload = payload
         self.serializer_id = serializer_id
+        self.protocol_id = protocol_id
         self.flags = flags
         self.sections = sections
         self.principal = None
@@ -185,14 +193,20 @@ class Framing:
         opting out of the protection this end requires.
     :param serializer_id: Recorded in the header, so the far end knows how
         the body was serialized.  Meaningful to the protocol, not here.
+    :param protocol_id: A second byte the protocol owns, carried and never
+        interpreted here.  It exists so a protocol can version the shape of
+        its own body without nesting a second envelope inside this one --
+        which is the whole reason for one envelope rather than two.
     """
 
     def __init__(self, layers: Sequence[Layer] = (),
                  require: int = 0,
-                 serializer_id: int = 0) -> None:
+                 serializer_id: int = 0,
+                 protocol_id: int = 0) -> None:
         self.layers = list(layers)
         self.require = require
         self.serializer_id = serializer_id
+        self.protocol_id = protocol_id
 
         # Worked out once, so that wrapping an unsecured message is a
         # branch rather than a walk over an empty pipeline.
@@ -213,8 +227,13 @@ class Framing:
     # ------------------------------------------------------------ outgoing --
 
     def wrap(self, payload: bytes,
-             credentials: Optional[bytes] = None) -> bytes:
-        """Frame a payload for sending."""
+             credentials: Optional[bytes] = None,
+             serializer_id: Optional[int] = None) -> bytes:
+        """Frame a payload for sending.
+
+        :param serializer_id: Overrides the default for this message, so a
+            server can answer in the encoding it was addressed in.
+        """
         flags = self._flags
         sections: Dict[str, bytes] = {}
 
@@ -228,8 +247,10 @@ class Framing:
                 if section is not None:
                     sections[layer.section] = section
 
-        head = struct.pack(HEADER, MAGIC, VERSION, flags,
-                           self.serializer_id, 0, len(payload))
+        head = struct.pack(
+            HEADER, MAGIC, VERSION, flags,
+            self.serializer_id if serializer_id is None else serializer_id,
+            self.protocol_id, len(payload))
         if not flags:
             return head + payload
 
@@ -255,7 +276,7 @@ class Framing:
         if len(data) < HEADER_LEN:
             raise FramingError('message shorter than a header')
 
-        magic, version, flags, serializer_id, _reserved, length = \
+        magic, version, flags, serializer_id, protocol_id, length = \
             struct.unpack(HEADER, data[:HEADER_LEN])
 
         if magic != MAGIC:
@@ -290,7 +311,8 @@ class Framing:
             raise FramingError('body length %d does not match header %d'
                                % (len(payload), length))
 
-        result = Unwrapped(payload, serializer_id, flags, sections)
+        result = Unwrapped(payload, serializer_id, protocol_id, flags,
+                           sections)
 
         if flags & ~FLAG_CREDENTIALS:
             for layer in reversed(self.layers):
