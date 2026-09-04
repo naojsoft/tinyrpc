@@ -42,6 +42,9 @@ class ZmqServerTransport(ServerTransport):
         self._incoming = _queue.Queue()
         self._outgoing = _queue.Queue()
         self._wake_r, self._wake_w = _socket.socketpair()
+        # Drained without asking whether it is readable, so it is never
+        # allowed to block; see _serve_socket.
+        self._wake_r.setblocking(False)
         self._ev_quit = threading.Event()
         self._thread = None
         self._shut = False
@@ -99,11 +102,23 @@ class ZmqServerTransport(ServerTransport):
             while not self._ev_quit.is_set():
                 events = dict(poller.poll(500))
 
-                if events.get(self._wake_r):
+                # Drain the wakeup unconditionally rather than asking the
+                # poll whether it fired.  pyzmq reports a native socket by
+                # its file descriptor rather than by the object registered,
+                # so looking it up by object never matched -- and an
+                # undrained pipe stays readable, which turned every poll
+                # into an immediate return.  The resulting spin starved the
+                # worker threads until one missed its deadline and a reply
+                # was never produced: a request would arrive, and nothing
+                # would answer it.
+                while True:
                     try:
-                        self._wake_r.recv(4096)
-                    except Exception:
-                        pass
+                        if not self._wake_r.recv(4096):
+                            break
+                    except (BlockingIOError, InterruptedError):
+                        break
+                    except OSError:
+                        break
 
                 while True:
                     try:
