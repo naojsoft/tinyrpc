@@ -303,9 +303,11 @@ class FlexRPCProtocol(RPCProtocol):
                  id_generator: Any = None) -> None:
         self.serializer = get_serializer(serializer)
         self.framing = framing if framing is not None else Framing()
-        # The framing's own defaults are what an unadorned wrap() would
-        # stamp; ours are what this protocol means by those bytes.
-        self.framing.serializer_id = self.serializer.id
+        # Every message names its own serializer when it is wrapped, so the
+        # framing's default for that is never consulted and is left alone --
+        # one Framing may be shared by protocols that encode differently,
+        # and stamping ours on it would make that a race.  The body version
+        # is a constant, so setting it is safe and has to happen somewhere.
         self.framing.protocol_id = BODY_VERSION
         self._credentials = (credentials.encode()
                              if credentials is not None else None)
