@@ -84,7 +84,7 @@ class HttpClientTransport(ClientTransport):
                 ('%s:%s' % self.auth).encode('utf-8')).decode('ascii')
             self._headers['Authorization'] = 'Basic ' + token
 
-    def _connection(self):
+    def _connection(self) -> http.client.HTTPConnection:
         if not self.secure:
             return http.client.HTTPConnection(self.host, self.port,
                                               timeout=self.timeout)

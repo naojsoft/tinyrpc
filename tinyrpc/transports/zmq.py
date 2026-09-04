@@ -76,7 +76,7 @@ class ZmqServerTransport(ServerTransport):
             # Never started, so nobody else will close the socket.
             self._close()
 
-    def _close(self):
+    def _close(self) -> None:
         """Close the socket and the wakeup pair, once.
 
         Both stop() and the socket thread's exit path want to do this, and
@@ -93,7 +93,7 @@ class ZmqServerTransport(ServerTransport):
             except Exception:
                 pass
 
-    def _serve_socket(self):
+    def _serve_socket(self) -> None:
         """Own the socket: receive requests, and send the replies queued."""
         poller = zmq.Poller()
         poller.register(self.socket, zmq.POLLIN)
@@ -223,7 +223,7 @@ class ZmqClientTransport(ClientTransport):
         self._all = []
         self._lock = threading.Lock()
 
-    def _socket(self):
+    def _socket(self) -> zmq.Socket:
         sock = getattr(self._local, 'socket', None)
         if sock is None:
             sock = self._make_socket()
@@ -232,7 +232,7 @@ class ZmqClientTransport(ClientTransport):
                 self._all.append(sock)
         return sock
 
-    def _discard(self):
+    def _discard(self) -> None:
         """Throw this thread's socket away, so the next call dials again.
 
         A REQ socket that did not complete its send/receive pair cannot be
@@ -307,7 +307,7 @@ class ZmqClientTransport(ClientTransport):
         :param endpoint: The endpoint the server is bound to.
         :param timeout: Seconds to wait for a reply.
         """
-        def factory():
+        def factory() -> zmq.Socket:
             sock = zmq_context.socket(zmq.REQ)
             sock.setsockopt(zmq.LINGER, 0)
             sock.connect(endpoint)

@@ -124,11 +124,11 @@ class ConnectionlessTcpServerTransport(ServerTransport):
         if thread is not None:
             thread.join(timeout=5.0)
 
-    def _log(self, message):
+    def _log(self, message: str) -> None:
         if self.logger is not None:
             self.logger.debug(message)
 
-    def _accept_forever(self):
+    def _accept_forever(self) -> None:
         self.sock.settimeout(0.5)
         while not self._ev_quit.is_set():
             try:
@@ -143,7 +143,7 @@ class ConnectionlessTcpServerTransport(ServerTransport):
             reader.daemon = True
             reader.start()
 
-    def _read_one(self, conn, addr):
+    def _read_one(self, conn: socket.socket, addr: Tuple) -> None:
         """Read one message off a freshly accepted connection.
 
         Runs on its own thread, so a client that connects and then says
@@ -186,7 +186,7 @@ class ConnectionlessTcpServerTransport(ServerTransport):
 
     @classmethod
     def create(cls, endpoint: tuple[str, int], backlog: int = 64,
-               packer: Any = None, **kwargs
+               packer: Any = None, **kwargs: Any
                ) -> 'ConnectionlessTcpServerTransport':
         """Create and bind a new server transport.
 
@@ -218,7 +218,7 @@ class TcpClientTransport(ClientTransport):
         self.packer = packer
         self.connect()
 
-    def connect(self):
+    def connect(self) -> None:
         self.sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         self.sock.connect(self.endpoint)
 
@@ -277,7 +277,7 @@ class TcpServerTransport(ServerTransport):
     def endpoint(self) -> tuple:
         return self.sock.getsockname()[:2]
 
-    def _log(self, message):
+    def _log(self, message: str) -> None:
         if self.logger is not None:
             self.logger.debug(message)
 
@@ -301,7 +301,7 @@ class TcpServerTransport(ServerTransport):
         if thread is not None:
             thread.join(timeout=5.0)
 
-    def _accept_forever(self):
+    def _accept_forever(self) -> None:
         self.sock.settimeout(0.5)
         while not self._ev_quit.is_set():
             try:
@@ -317,7 +317,7 @@ class TcpServerTransport(ServerTransport):
             reader.daemon = True
             reader.start()
 
-    def _serve_connection(self, conn, addr):
+    def _serve_connection(self, conn: socket.socket, addr: Tuple) -> None:
         """Read requests off one connection for as long as it lasts."""
         context = SimpleNamespace(sock=conn, client_address=addr,
                                   send_lock=threading.Lock(),
@@ -363,7 +363,8 @@ class TcpServerTransport(ServerTransport):
 
     @classmethod
     def create(cls, endpoint: tuple[str, int], backlog: int = 64,
-               packer: Any = None, **kwargs) -> 'TcpServerTransport':
+               packer: Any = None,
+               **kwargs: Any) -> 'TcpServerTransport':
         """Create and bind a new server transport.
 
         :param endpoint: The endpoint clients will connect to.  Use port 0 to
@@ -430,7 +431,7 @@ class NonBlockingTcpClientTransport(NonBlockingClientTransport):
         self._last_attempt = 0.0
         self._closed = False
 
-    def _log(self, message):
+    def _log(self, message: str) -> None:
         if self.logger is not None:
             self.logger.debug(message)
 
@@ -443,7 +444,7 @@ class NonBlockingTcpClientTransport(NonBlockingClientTransport):
         """Establish the connection now, rather than on the first send."""
         self._ensure_connection()
 
-    def _ensure_connection(self):
+    def _ensure_connection(self) -> socket.socket:
         """Return a live socket, dialling if there is not one.
 
         :raises ConnectionError: if a connection cannot be established.
@@ -490,7 +491,7 @@ class NonBlockingTcpClientTransport(NonBlockingClientTransport):
             self._log('connected to %s' % (self.endpoint,))
             return sock
 
-    def _drop(self, generation, why):
+    def _drop(self, generation: int, why: Any) -> None:
         """Forget the current connection, if it is still the one named.
 
         The generation check keeps a reader that has just noticed a dead
@@ -507,7 +508,7 @@ class NonBlockingTcpClientTransport(NonBlockingClientTransport):
                 pass
             self._sock = None
 
-    def _read_forever(self, sock, generation):
+    def _read_forever(self, sock: socket.socket, generation: int) -> None:
         """Own the receiving end of one connection."""
         while True:
             try:
@@ -559,7 +560,6 @@ class NonBlockingTcpClientTransport(NonBlockingClientTransport):
         """Close the connection and stop reconnecting."""
         with self._lock:
             self._closed = True
-            generation, self._generation = self._generation, self._generation
             if self._sock is not None:
                 try:
                     self._sock.close()
@@ -584,16 +584,16 @@ class TransportPacker:
         self.version = b'1.0'
         self.chunk_size = 4096
 
-    def pack(self, msg):
+    def pack(self, msg: bytes) -> bytes:
         return msg
 
-    def send(self, sock, msg):
+    def send(self, sock: socket.socket, msg: bytes) -> None:
         try:
             sock.sendall(msg)
         except socket.error as e:
             raise ConnectionError(f"socket send error: {e}")
 
-    def recv(self, sock):
+    def recv(self, sock: socket.socket) -> bytes:
         # read msg body from socket, fixed size
         try:
             msg = sock.recv(self.chunk_size)
@@ -615,7 +615,7 @@ class TransportPackerRobust(TransportPacker):
         self.version = b'1.0'
         self.rpc_hdr_len = 32
 
-    def pack(self, msg):
+    def pack(self, msg: bytes) -> bytes:
         hdr = b'%s,%d' % (
             self.version, len(msg))
         # pad header to required size
@@ -625,13 +625,13 @@ class TransportPackerRobust(TransportPacker):
                 len(hdr), self.rpc_hdr_len))
         return hdr + msg
 
-    def send(self, sock, msg):
+    def send(self, sock: socket.socket, msg: bytes) -> None:
         try:
             sock.sendall(self.pack(msg))
         except socket.error as e:
             raise ConnectionError(f"socket send error: {e}")
 
-    def recv(self, sock):
+    def recv(self, sock: socket.socket) -> bytes:
         # receive RPC header
         try:
             hdr = sock.recv(self.rpc_hdr_len, socket.MSG_WAITALL)
@@ -688,7 +688,7 @@ class AsyncioTcpClientTransport(ClientTransport):
         self.packer = packer
         self.connect()
 
-    async def connect(self):
+    async def connect(self) -> None:
         host, port = self.endpoint
         self.reader, self.writer = await asyncio.open_connection(host, port)
 
@@ -716,13 +716,14 @@ class AsyncioTcpServerTransport(ServerTransport):
             packer = AsyncioTransportPacker()
         self.packer = packer
 
-    async def start(self):
+    async def start(self) -> None:
         host, port = self.endpoint
         while True:
             server = await asyncio.start_server(self._server, host, port)
             await server.serve_forever()
 
-    async def _server(self, reader, writer):
+    async def _server(self, reader: asyncio.StreamReader,
+                      writer: asyncio.StreamWriter) -> None:
         # create a Transport context to be passed around as needed
         ctx = SimpleNamespace(inbox=asyncio.Queue(), outbox=asyncio.Queue(),
                               ev_quit=asyncio.Event())
@@ -732,7 +733,8 @@ class AsyncioTcpServerTransport(ServerTransport):
         await t1
         await t2
 
-    async def _service_recv(self, reader, ctx):
+    async def _service_recv(self, reader: asyncio.StreamReader,
+                            ctx: SimpleNamespace) -> None:
         while not ctx.ev_quit.is_set():
             # service incoming
             try:
@@ -745,7 +747,8 @@ class AsyncioTcpServerTransport(ServerTransport):
                 await ctx.inbox.put(recv_data)
                 await self.incoming.put(ctx)
 
-    async def _service_send(self, writer, ctx):
+    async def _service_send(self, writer: asyncio.StreamWriter,
+                            ctx: SimpleNamespace) -> None:
         while not ctx.ev_quit.is_set():
             # service outgoing
             send_data = await ctx.outbox.get()
@@ -782,16 +785,17 @@ class AsyncioTransportPacker:
         self.version = b'1.0'
         self.chunk_size = 4096
 
-    def pack(self, msg):
+    def pack(self, msg: bytes) -> bytes:
         return msg
 
-    async def send(self, writer, msg):
+    async def send(self, writer: asyncio.StreamWriter,
+                   msg: bytes) -> None:
         #print("writer writing")
         writer.write(msg)
         await writer.drain()
         #print("writer wrote message")
 
-    async def recv(self, reader):
+    async def recv(self, reader: asyncio.StreamReader) -> bytes:
         # read msg body from socket, fixed size
         #print("reader reading")
         msg = await reader.read(n=self.chunk_size)

@@ -164,7 +164,7 @@ class RPCServer(object):
 
         self._spawn(handle_message, context, message)
 
-    def _spawn(self, func: Callable, *args, **kwargs):
+    def _spawn(self, func: Callable, *args: Any, **kwargs: Any) -> None:
         """Spawn a handler function.
 
         This function is overridden in subclasses to provide concurrency.
@@ -244,7 +244,7 @@ class AsyncioRPCServer(RPCServer):
 
         self._spawn(handle_message, context, message)
 
-    def _spawn(self, func: Callable, *args, **kwargs):
+    def _spawn(self, func: Callable, *args: Any, **kwargs: Any) -> None:
         """Spawn a handler function.
 
         This function is overridden in subclasses to provide concurrency.

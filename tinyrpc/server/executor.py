@@ -4,7 +4,7 @@
 Defines and implements a concurrent asynchronous server using a
 concurrent.futures.Executor.
 """
-from typing import Callable
+from typing import Any, Callable
 #from concurrent.futures import Executor
 import threading
 
@@ -29,17 +29,17 @@ class RPCServerExecutor(RPCServer):
             ev_quit = threading.Event()
         self.ev_quit = ev_quit
 
-    def _spawn(self, func: Callable, *args, **kwargs):
+    def _spawn(self, func: Callable, *args: Any, **kwargs: Any) -> None:
         self.executor.submit(func, *args, **kwargs)
 
-    def start(self):
+    def start(self) -> None:
         """Start the transport, if it needs starting, then the serve loop."""
         start = getattr(self.transport, 'start', None)
         if callable(start):
             start()
         self.executor.submit(self.serve_forever)
 
-    def serve_forever(self):
+    def serve_forever(self) -> None:
         while not self.ev_quit.is_set():
             try:
                 self.receive_one_message()
@@ -49,7 +49,7 @@ class RPCServerExecutor(RPCServer):
                 # re-test ev_quit, so just go round again.
                 continue
 
-    def stop(self):
+    def stop(self) -> None:
         """Ask the serve loop to exit, and shut the transport down.
 
         Setting ``ev_quit`` alone only ends the loop once ``receive_one_message``

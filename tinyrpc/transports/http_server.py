@@ -82,7 +82,7 @@ class _RPCRequestHandler(BaseHTTPRequestHandler):
     # Filled in by the transport when it builds the server.
     transport = None
 
-    def do_POST(self):
+    def do_POST(self) -> None:
         transport = self.transport
 
         try:
@@ -136,10 +136,10 @@ class _RPCRequestHandler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(reply)
 
-    def do_GET(self):
+    def do_GET(self) -> None:
         self.send_error(405, 'Only POST is supported')
 
-    def log_message(self, fmt, *args):
+    def log_message(self, fmt: str, *args: Any) -> None:
         logger = getattr(self.transport, 'logger', None)
         if logger is not None:
             logger.debug("%s - %s" % (self.address_string(), fmt % args))
