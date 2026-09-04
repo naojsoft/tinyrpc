@@ -671,10 +671,16 @@ class TransportPackerRobust(TransportPacker):
 
 
 class AsyncioTcpClientTransport(ClientTransport):
-    """
+    """An asyncio TCP client, holding its connection open.
+
     NOTE: (from the base class doc)
     Also note that the client transport interface is not designed for
     asynchronous use. This means each thread should make their own client.
+
+    The connection is opened on the first send rather than in the
+    constructor: ``connect()`` is a coroutine, and a constructor cannot await
+    one -- it used to call it and drop the coroutine on the floor, which left
+    the transport with no reader or writer and made it unusable.
     """
 
     def __init__(self,
@@ -686,20 +692,35 @@ class AsyncioTcpClientTransport(ClientTransport):
         if packer is None:
             packer = AsyncioTransportPacker()
         self.packer = packer
-        self.connect()
+        self.reader = None
+        self.writer = None
 
     async def connect(self) -> None:
+        """Open the connection, if it is not open already."""
+        if self.writer is not None:
+            return
         host, port = self.endpoint
         self.reader, self.writer = await asyncio.open_connection(host, port)
 
+    async def close(self) -> None:
+        """Close the connection."""
+        writer, self.writer, self.reader = self.writer, None, None
+        if writer is not None:
+            writer.close()
+            try:
+                await writer.wait_closed()
+            except Exception:
+                pass
+
     async def send_message(self, message: bytes,
-                           expect_reply: bool =True) -> bytes:
+                           expect_reply: bool = True) -> bytes:
+        await self.connect()
         await self.packer.send(self.writer, message)
 
         if expect_reply:
             try:
                 recv_data = await self.packer.recv(self.reader)
-            except ConnectionError as e:
+            except ConnectionError:
                 recv_data = b''
             return recv_data
 
