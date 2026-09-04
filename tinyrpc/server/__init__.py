@@ -8,12 +8,16 @@ Defines and implements a single-threaded, single-process, synchronous server.
 # FIXME: needs (more) unittests
 # FIXME: needs checks for out-of-order, concurrency, etc as attributes
 import asyncio
+import logging
 from typing import Any, Callable
 
 import tinyrpc.exc
 from tinyrpc import RPCProtocol
 from tinyrpc.dispatch import RPCDispatcher
 from tinyrpc.transports import ServerTransport, TransportTimeout
+
+
+logger = logging.getLogger(__name__)
 
 
 def _is_coroutine_method(dispatcher: RPCDispatcher, request: Any) -> bool:
@@ -101,6 +105,12 @@ class RPCServer(object):
     knows about the caller and what the protocol made of the request, so the
     same policy works whichever of the two is swapped out.
     """
+    logger = None
+    """Where a failed handler is reported.
+
+    Defaults to this module's logger.  A handler that raises is reported
+    here rather than vanishing into a Future or a Task nobody reads.
+    """
     def __init__(
             self, transport: ServerTransport, protocol: RPCProtocol,
             dispatcher: RPCDispatcher
@@ -110,6 +120,7 @@ class RPCServer(object):
         self.dispatcher = dispatcher
         self.trace = None
         self.authenticator = None
+        self.logger = None
 
     def serve_forever(self) -> None:
         """Handle requests forever.
@@ -171,7 +182,42 @@ class RPCServer(object):
                     self.trace('<--', context, result)
                 self.transport.send_reply(context, result)
 
-        self._spawn(handle_message, context, message)
+        def guarded(context: Any, message: bytes) -> None:
+            """Run the handler, and answer even if it fails.
+
+            Serializing a response can raise -- a result the protocol cannot
+            encode is the usual way -- and so can a protocol that reports a
+            malformed request with something other than an RPCError.  Without
+            this, such a failure sent no reply and logged nothing, so the
+            caller waited out its timeout with no idea why.
+            """
+            request = None
+            try:
+                request = self.protocol.parse_request(message)
+            except Exception:
+                pass                    # handle_message reports this properly
+
+            try:
+                handle_message(context, message)
+            except Exception as e:
+                self._report_failure(context, request, e)
+
+        self._spawn(guarded, context, message)
+
+    def _report_failure(self, context: Any, request: Any,
+                        error: Exception) -> None:
+        """Log a handler that failed, and tell the caller if we still can."""
+        log = self.logger if self.logger is not None else logger
+        log.exception('error handling a request: %s', error)
+
+        if request is None:
+            return
+        try:
+            response = request.error_respond(error)
+            if response is not None:
+                self.transport.send_reply(context, response.serialize())
+        except Exception:
+            log.exception('could not report that failure to the caller')
 
     def _spawn(self, func: Callable, *args: Any, **kwargs: Any) -> None:
         """Spawn a handler function.
@@ -279,7 +325,35 @@ class AsyncioRPCServer(RPCServer):
                     self.trace('<--', context, result)
                 await self.transport.send_reply(context, result)
 
-        self._spawn(handle_message, context, message)
+        async def guarded(context: Any, message: bytes) -> None:
+            """As for the synchronous server: answer even if the handler
+            fails, rather than leaving the caller to time out."""
+            request = None
+            try:
+                request = self.protocol.parse_request(message)
+            except Exception:
+                pass
+
+            try:
+                await handle_message(context, message)
+            except Exception as e:
+                await self._report_failure_async(context, request, e)
+
+        self._spawn(guarded, context, message)
+
+    async def _report_failure_async(self, context: Any, request: Any,
+                                    error: Exception) -> None:
+        log = self.logger if self.logger is not None else logger
+        log.exception('error handling a request: %s', error)
+
+        if request is None:
+            return
+        try:
+            response = request.error_respond(error)
+            if response is not None:
+                await self.transport.send_reply(context, response.serialize())
+        except Exception:
+            log.exception('could not report that failure to the caller')
 
     async def _dispatch(self, request: Any) -> Any:
         """Dispatch a request, awaiting the method if it is a coroutine.
@@ -330,3 +404,14 @@ class AsyncioRPCServer(RPCServer):
         task = asyncio.create_task(func(*args, **kwargs))
         self.tasks.add(task)
         task.add_done_callback(self.tasks.discard)
+        task.add_done_callback(self._log_task_result)
+
+    def _log_task_result(self, task: Any) -> None:
+        """Read a finished task's exception, so it is reported rather than
+        surfacing much later as "Task exception was never retrieved"."""
+        if task.cancelled():
+            return
+        error = task.exception()
+        if error is not None:
+            log = self.logger if self.logger is not None else logger
+            log.error('handler task failed', exc_info=error)

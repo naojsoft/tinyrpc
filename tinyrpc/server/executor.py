@@ -8,7 +8,7 @@ from typing import Any, Callable
 #from concurrent.futures import Executor
 import threading
 
-from . import RPCServer
+from . import RPCServer, logger as _server_logger
 from ..transports import TransportTimeout
 
 
@@ -30,7 +30,25 @@ class RPCServerExecutor(RPCServer):
         self.ev_quit = ev_quit
 
     def _spawn(self, func: Callable, *args: Any, **kwargs: Any) -> None:
-        self.executor.submit(func, *args, **kwargs)
+        future = self.executor.submit(func, *args, **kwargs)
+        future.add_done_callback(self._log_future_result)
+
+    def _log_future_result(self, future: Any) -> None:
+        """Read a finished handler's exception, so it is reported.
+
+        An Executor stores an exception on its Future and says nothing.  With
+        the Future discarded, as it was, a handler that failed left no reply
+        and no trace of why.
+        """
+        if future.cancelled():
+            return
+        try:
+            error = future.exception()
+        except Exception:
+            return
+        if error is not None:
+            log = self.logger if self.logger is not None else _server_logger
+            log.error('handler failed', exc_info=error)
 
     def start(self) -> None:
         """Start the transport, if it needs starting, then the serve loop."""
