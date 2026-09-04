@@ -44,6 +44,7 @@ class ZmqServerTransport(ServerTransport):
         self._wake_r, self._wake_w = _socket.socketpair()
         self._ev_quit = threading.Event()
         self._thread = None
+        self._shut = False
         self._lifecycle = threading.Lock()
 
     def start(self) -> None:
@@ -73,6 +74,16 @@ class ZmqServerTransport(ServerTransport):
             self._close()
 
     def _close(self):
+        """Close the socket and the wakeup pair, once.
+
+        Both stop() and the socket thread's exit path want to do this, and
+        closing a socketpair twice leaves the poller registered against a
+        file descriptor of -1.
+        """
+        with self._lifecycle:
+            if self._shut:
+                return
+            self._shut = True
         for handle in (self.socket, self._wake_r, self._wake_w):
             try:
                 handle.close()
@@ -167,64 +178,124 @@ class ZmqServerTransport(ServerTransport):
 
 
 class ZmqClientTransport(ClientTransport):
-    """Client transport based on a :py:const:`zmq.REQ` socket.
+    """Client transport over a :py:const:`zmq.REQ` socket, held open.
 
-    :param socket: A :py:const:`zmq.REQ` socket instance, connected to the
-                   server socket.
-    :param timeout: An optional float. When set it defines the time period
-                    in seconds to wait for a reply.
-                    It will generate a :py:class:`exc.TimeoutError` exception
-                    if no reply was received in time.
+    0mq expects peers to last.  A client that made a socket per call, dialled,
+    sent and threw the socket away worked for a while and then began losing
+    replies -- around three hundred calls in, with the server healthy and its
+    queues empty -- because the router's idea of who its peers are cannot keep
+    up with that much churn.  So the socket is kept.
+
+    A 0mq socket must not be shared between threads, and a REQ socket also
+    insists on strict send/receive alternation, so one is kept *per thread*
+    rather than one per transport.  A thread therefore reuses its socket for
+    every call it makes, and threads never contend.  This is what lets a
+    single transport object be shared, which is how Gen2 uses a client.
+
+    If a socket is left in a bad state by a failed exchange it is discarded
+    and the next call on that thread dials again, which is the closest thing
+    0mq has to the reconnection a stream transport needs.
+
+    :param socket_factory: Called with no arguments to make a connected REQ
+        socket for the calling thread.
+    :param timeout: Seconds to wait for a reply.
     """
 
-    def __init__(self, socket: zmq.Socket, timeout: float = None) -> None:
-        self.socket = socket
+    def __init__(self, socket_factory, timeout: float = None) -> None:
+        self._make_socket = socket_factory
         self.timeout = timeout
+        self._local = threading.local()
+        self._all = []
+        self._lock = threading.Lock()
 
-    def close(self) -> None:
-        """Release the socket.
+    def _socket(self):
+        sock = getattr(self._local, 'socket', None)
+        if sock is None:
+            sock = self._make_socket()
+            self._local.socket = sock
+            with self._lock:
+                self._all.append(sock)
+        return sock
 
-        A caller that builds a transport per call -- which is how a
-        connectionless client works -- would otherwise leave a socket behind
-        each time, to be closed whenever the garbage collector got to it.
+    def _discard(self):
+        """Throw this thread's socket away, so the next call dials again.
+
+        A REQ socket that did not complete its send/receive pair cannot be
+        reused: it would refuse the next send.  Rather than track how far
+        through the exchange we got, the socket is replaced.
         """
+        sock = getattr(self._local, 'socket', None)
+        self._local.socket = None
+        if sock is None:
+            return
+        with self._lock:
+            try:
+                self._all.remove(sock)
+            except ValueError:
+                pass
         try:
-            self.socket.close(linger=0)
+            sock.close(linger=0)
         except Exception:
             pass
 
-    def send_message(self, message: bytes, expect_reply: bool = True) -> bytes:
-        self.socket.send(message)
+    def send_message(self, message: bytes, expect_reply: bool = True,
+                     timeout: Any = None) -> bytes:
+        if timeout is None:
+            timeout = self.timeout
 
-        # zmq contains a state machine preventing a new request
-        # until the previous one is answered, so always receive
-        if self.timeout is None:
-            reply = self.socket.recv()
-        else:
-            poller = zmq.Poller()
-            poller.register(self.socket, zmq.POLLIN)
-            ready = dict(poller.poll(int(self.timeout * 1000)))
-            if ready.get(self.socket) == zmq.POLLIN:
-                reply = self.socket.recv()
+        sock = self._socket()
+        try:
+            sock.send(message)
+        except Exception:
+            self._discard()
+            raise
+
+        # 0mq's REQ will not send again until this reply is taken, so it is
+        # always read, whether or not the caller wants it.
+        try:
+            if timeout is None:
+                reply = sock.recv()
             else:
-                raise exc.TimeoutError()
+                if not sock.poll(int(timeout * 1000), zmq.POLLIN):
+                    self._discard()
+                    raise exc.TimeoutError()
+                reply = sock.recv()
+        except exc.TimeoutError:
+            raise
+        except Exception:
+            self._discard()
+            raise
+
         if expect_reply:
             return reply
 
+    def close(self) -> None:
+        """Close every socket this transport has handed out."""
+        with self._lock:
+            sockets, self._all = self._all, []
+        for sock in sockets:
+            try:
+                sock.close(linger=0)
+            except Exception:
+                pass
+        self._local = threading.local()
+
     @classmethod
-    def create(cls, zmq_context: zmq.Context, endpoint: str, timeout: float = None) -> 'ZmqClientTransport':
-        """Create new client transport.
+    def create(cls, zmq_context: zmq.Context, endpoint: str,
+               timeout: float = None) -> 'ZmqClientTransport':
+        """Create a client transport for _endpoint_.
 
-        Instead of creating the socket yourself, you can call this function and
-        merely pass the :py:class:`zmq.core.context.Context` instance.
-
-        By passing a context imported from :py:mod:`zmq.green`, you can use
-        green (gevent) 0mq sockets as well.
+        The socket itself is made when a thread first makes a call, since it
+        belongs to that thread.
 
         :param zmq_context: A 0mq context.
         :param endpoint: The endpoint the server is bound to.
-        :param timeout: Optional period in seconds to wait for reply
+        :param timeout: Seconds to wait for a reply.
         """
-        socket = zmq_context.socket(zmq.REQ)
-        socket.connect(endpoint)
-        return cls(socket, timeout)
+        def factory():
+            sock = zmq_context.socket(zmq.REQ)
+            sock.setsockopt(zmq.LINGER, 0)
+            sock.connect(endpoint)
+            return sock
+
+        return cls(factory, timeout)
