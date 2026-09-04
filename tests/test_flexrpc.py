@@ -448,3 +448,113 @@ def test_a_method_that_raises_comes_back_as_an_error():
     finally:
         server.stop()
         executor.shutdown(wait=False)
+
+
+# --------------------------------------------------------------- numpy --
+
+def _has_working_msgpack_numpy():
+    """msgpack-numpy hands the packer an ndarray's memoryview, and msgpack's
+    pure-Python fallback writes the element count where the byte count
+    belongs.  Only the C extension gets this right."""
+    try:
+        import msgpack
+        import msgpack_numpy
+        import numpy as np
+    except ImportError:
+        return False
+    a = np.arange(12, dtype='f4').reshape(3, 4)
+    try:
+        return np.array_equal(
+            msgpack_numpy.unpackb(msgpack_numpy.packb(a, use_bin_type=True),
+                                  raw=False), a)
+    except Exception:
+        return False
+
+
+needs_numpy = pytest.mark.skipif(
+    not _has_working_msgpack_numpy(),
+    reason='needs msgpack-numpy on msgpack with its C extension')
+
+
+@needs_numpy
+def test_an_array_survives_the_trip():
+    import numpy as np
+    client = FlexRPCProtocol('msgpack-numpy')
+    server = FlexRPCProtocol('json')          # its own preference is irrelevant
+
+    a = np.arange(12, dtype='f4').reshape(3, 4)
+    _request, arrived = roundtrip(client, server, 'put', (a,))
+
+    assert np.array_equal(arrived.args[0], a)
+    assert arrived.args[0].dtype == a.dtype, "dtype must survive, not just values"
+
+
+@needs_numpy
+def test_an_array_comes_back_too():
+    import numpy as np
+    client = FlexRPCProtocol('msgpack-numpy')
+    server = FlexRPCProtocol('msgpack-numpy')
+
+    a = np.linspace(0, 1, 64).reshape(8, 8)
+    _request, arrived = roundtrip(client, server, 'scale', (a,))
+    reply = client.parse_reply(arrived.respond(arrived.args[0] * 2).serialize())
+    assert np.allclose(reply.result, a * 2)
+
+
+@needs_numpy
+def test_an_array_is_carried_as_a_buffer_not_a_list_of_numbers():
+    import numpy as np
+    a = np.zeros(1000, dtype='f8')
+    packed = FlexRPCProtocol('msgpack-numpy').create_request('put', [a])
+    assert len(packed.serialize()) < 8500, "should be the raw 8000 bytes plus a little"
+
+
+def test_a_peer_without_numpy_encoding_is_told_so_not_left_guessing():
+    """The header names the encoding, so an array does not arrive quietly
+    decoded into something that is not one."""
+    from tinyrpc.serializers import SERIALIZER_MSGPACK_NUMPY, serializer_by_id
+    assert serializer_by_id(SERIALIZER_MSGPACK_NUMPY).name == 'msgpack-numpy'
+
+    protocol = FlexRPCProtocol('json')
+    wire = bytearray(protocol.create_request('put', [[1, 2]]).serialize())
+    wire[4] = 200                                 # an id nobody has
+    with pytest.raises(RPCError) as excinfo:
+        protocol.parse_request(bytes(wire))
+    assert 'no serializer' in str(excinfo.value)
+
+
+def test_a_site_can_register_its_own_encoding():
+    from tinyrpc import serializers
+    calls = []
+
+    def dumps(obj):
+        calls.append('dumps')
+        return repr(obj).encode()
+
+    def loads(data):
+        import ast
+        return ast.literal_eval(data.decode())
+
+    serializers.register('reprs', serializers.SERIALIZER_LOCAL, dumps, loads)
+    try:
+        client = FlexRPCProtocol('reprs')
+        _request, arrived = roundtrip(client, FlexRPCProtocol('json'))
+        assert arrived.args == ['hi']
+        assert calls, "the registered encoder should have been used"
+    finally:
+        del serializers.SERIALIZERS['reprs']
+        del serializers._BY_ID[serializers.SERIALIZER_LOCAL]
+
+
+def test_an_id_that_is_already_spoken_for():
+    from tinyrpc import serializers
+    with pytest.raises(ValueError) as excinfo:
+        serializers.register('mine', serializers.SERIALIZER_JSON,
+                             lambda o: b'', lambda d: None)
+    assert 'json' in str(excinfo.value)
+
+
+def test_an_id_that_does_not_fit_in_the_header():
+    from tinyrpc import serializers
+    with pytest.raises(ValueError):
+        serializers.register('mine', 256, lambda o: b'', lambda d: None)
