@@ -11,8 +11,9 @@ from tinyrpc import framing
 from tinyrpc.framing import (FLAG_COMPRESSED, FLAG_CREDENTIALS,
                              FLAG_ENCRYPTED, FLAG_SIGNED, Framing,
                              FramingError, PolicyError, UnsupportedVersion)
-from tinyrpc.layers import (Credentials, Deflate, Encrypt, Signature,
-                            derive_key)
+from tinyrpc.layers import (Credentials, Deflate, Ed25519Signature,
+                            Encrypt, Signature, derive_key,
+                            generate_signing_key)
 
 KEY = b'k' * 32
 BODY = b'{"method": "echo"}'
@@ -508,3 +509,244 @@ def test_a_truncated_signature_section():
         f.unwrap(bytes(wrapped))
     assert 'truncated' in str(excinfo.value), \
         "it should say what is wrong, not blame the key it mis-read"
+
+
+# ------------------------------------------------------------- replay --
+
+def test_a_captured_message_can_be_sent_again_by_default():
+    """Stated so the default is a decision, not an oversight: the timestamp
+    bounds the window, it does not close it."""
+    f = Framing(layers=[Signature(KEY_A)])
+    wrapped = f.wrap(BODY)
+    assert f.unwrap(wrapped).payload == BODY
+    assert f.unwrap(wrapped).payload == BODY
+
+
+def test_a_remembered_nonce_is_refused_the_second_time():
+    f = Framing(layers=[Signature(KEY_A, replay_cache=1000)])
+    wrapped = f.wrap(BODY)
+    assert f.unwrap(wrapped).payload == BODY
+
+    with pytest.raises(FramingError) as excinfo:
+        f.unwrap(wrapped)
+    assert 'already been delivered' in str(excinfo.value)
+
+
+def test_distinct_messages_are_all_accepted():
+    """The cache must reject repeats, not traffic."""
+    f = Framing(layers=[Signature(KEY_A, replay_cache=1000)])
+    for _ in range(50):
+        assert f.unwrap(f.wrap(BODY)).payload == BODY
+
+
+def test_the_same_body_twice_is_not_a_replay():
+    """Two genuine calls with identical arguments are ordinary; only the
+    same nonce is a replay."""
+    f = Framing(layers=[Signature(KEY_A, replay_cache=1000)])
+    assert f.unwrap(f.wrap(BODY)).payload == BODY
+    assert f.unwrap(f.wrap(BODY)).payload == BODY
+
+
+def test_a_replay_cache_needs_a_bound():
+    with pytest.raises(ValueError) as excinfo:
+        Signature(KEY_A, max_age=None, replay_cache=100)
+    assert 'max_age' in str(excinfo.value)
+
+
+def test_a_full_cache_shortens_the_window_rather_than_refusing_traffic():
+    """When it overflows something has to give.  Dropping the oldest
+    memories keeps honest calls working, and says so, rather than growing
+    without limit or failing closed on legitimate traffic."""
+    layer = Signature(KEY_A, replay_cache=4)
+    f = Framing(layers=[layer])
+
+    first = f.wrap(BODY)
+    f.unwrap(first)
+    for _ in range(10):
+        f.unwrap(f.wrap(BODY))
+
+    assert layer._replay.overflows > 0, "the cache should report the squeeze"
+    assert f.unwrap(first).payload == BODY, \
+        "the oldest nonce was forgotten, as documented"
+
+
+def test_two_senders_drawing_the_same_nonce_do_not_collide():
+    """The token is per key, so one service cannot lock another out by
+    happening to pick the same random bytes."""
+    from tinyrpc.layers import _ReplayCache
+    cache = _ReplayCache(window=60.0, capacity=100)
+    assert not cache.seen(b'status' + b'12345678')
+    assert not cache.seen(b'taskmgr' + b'12345678')
+    assert cache.seen(b'status' + b'12345678')
+
+
+# ------------------------------------------------------------ ed25519 --
+
+def test_a_verifier_needs_no_power_to_forge():
+    """The whole point against HMAC: the end that checks status's messages
+    holds only a public key, so compromising it does not let anyone speak
+    as status."""
+    private, public = generate_signing_key()
+    status = Framing(layers=[Ed25519Signature({'status': public},
+                                              signing_key=private)])
+    verifier = Framing(layers=[Ed25519Signature({'status': public})])
+
+    assert verifier.unwrap(status.wrap(BODY)).principal == 'status'
+    with pytest.raises(FramingError) as excinfo:
+        verifier.wrap(BODY)
+    assert 'only' in str(excinfo.value) and 'verify' in str(excinfo.value)
+
+
+def test_a_verifier_may_hold_many_public_keys_without_choosing_one():
+    """A name service listing every service has no identity of its own to
+    pick, so it must not be asked to."""
+    _p1, pub1 = generate_signing_key()
+    _p2, pub2 = generate_signing_key()
+    verifier = Ed25519Signature({'status': pub1, 'taskmgr': pub2})
+    assert verifier._sign_key is None
+
+
+def test_each_service_arrives_as_itself():
+    priv_s, pub_s = generate_signing_key()
+    priv_t, pub_t = generate_signing_key()
+    table = {'status': pub_s, 'taskmgr': pub_t}
+    end = Framing(layers=[Ed25519Signature(table)])
+
+    status = Framing(layers=[Ed25519Signature(table, sign_as='status',
+                                              signing_key=priv_s)])
+    taskmgr = Framing(layers=[Ed25519Signature(table, sign_as='taskmgr',
+                                               signing_key=priv_t)])
+    assert end.unwrap(status.wrap(BODY)).principal == 'status'
+    assert end.unwrap(taskmgr.wrap(BODY)).principal == 'taskmgr'
+
+
+def test_holding_one_private_key_does_not_let_you_sign_as_another():
+    priv_s, pub_s = generate_signing_key()
+    _priv_t, pub_t = generate_signing_key()
+    table = {'status': pub_s, 'taskmgr': pub_t}
+
+    with pytest.raises(ValueError) as excinfo:
+        Ed25519Signature(table, sign_as='taskmgr', signing_key=priv_s)
+    assert 'does not match' in str(excinfo.value)
+
+
+def test_a_key_pair_that_does_not_go_together_is_caught_at_setup():
+    """Rather than as unexplained verification failures on every message."""
+    priv, _pub = generate_signing_key()
+    _other, other_pub = generate_signing_key()
+    with pytest.raises(ValueError):
+        Ed25519Signature({'status': other_pub}, signing_key=priv)
+
+
+def test_ed25519_refuses_a_tampered_body():
+    private, public = generate_signing_key()
+    f = Framing(layers=[Ed25519Signature({'status': public},
+                                         signing_key=private)])
+    wrapped = bytearray(f.wrap(BODY))
+    wrapped[-1] ^= 0xFF
+    with pytest.raises(FramingError) as excinfo:
+        f.unwrap(bytes(wrapped))
+    assert 'does not match' in str(excinfo.value)
+
+
+def test_ed25519_refuses_an_unknown_signer():
+    _priv_known, pub_known = generate_signing_key()
+    priv_other, pub_other = generate_signing_key()
+    stranger = Framing(layers=[Ed25519Signature({'stranger': pub_other},
+                                                signing_key=priv_other)])
+    end = Framing(layers=[Ed25519Signature({'status': pub_known})])
+    with pytest.raises(FramingError) as excinfo:
+        end.unwrap(stranger.wrap(BODY))
+    assert 'stranger' in str(excinfo.value)
+
+
+def test_ed25519_inherits_the_audience_binding():
+    private, public = generate_signing_key()
+    to_status = Framing(layers=[Ed25519Signature(
+        {'gw': public}, signing_key=private, audience='status')])
+    at_taskmgr = Framing(layers=[Ed25519Signature(
+        {'gw': public}, audience='taskmgr')])
+    with pytest.raises(FramingError) as excinfo:
+        at_taskmgr.unwrap(to_status.wrap(BODY))
+    assert 'not signed for this service' in str(excinfo.value)
+
+
+def test_ed25519_inherits_the_freshness_check():
+    private, public = generate_signing_key()
+    f = Framing(layers=[Ed25519Signature({'status': public},
+                                         signing_key=private,
+                                         max_age=0.0001)])
+    wrapped = f.wrap(BODY)
+    time.sleep(0.01)
+    with pytest.raises(FramingError) as excinfo:
+        f.unwrap(wrapped)
+    assert 'old' in str(excinfo.value)
+
+
+def test_ed25519_survives_the_other_layers():
+    private, public = generate_signing_key()
+    layers = [Deflate(), Encrypt(KEY),
+              Ed25519Signature({'status': public}, signing_key=private)]
+    f = Framing(layers=layers)
+    got = f.unwrap(f.wrap(b'z' * 5000))
+    assert got.payload == b'z' * 5000
+    assert got.principal == 'status'
+
+
+def test_generate_signing_key_gives_a_matched_pair():
+    private, public = generate_signing_key()
+    assert len(private) == 32 and len(public) == 32
+    assert generate_signing_key()[0] != private, "must not be deterministic"
+
+
+def test_one_service_cannot_lock_another_out_by_picking_its_nonce(monkeypatch):
+    """Make every nonce identical, so only the key id separates them.  If
+    the token ignored the key id, taskmgr's first message would be refused
+    as a replay of status's."""
+    monkeypatch.setattr('tinyrpc.layers.os.urandom', lambda n: b'\x01' * n)
+
+    end = Framing(layers=[Signature({'status': KEY_A, 'taskmgr': KEY_B},
+                                    sign_as='status', replay_cache=1000)])
+    status = Framing(layers=[Signature({'status': KEY_A})])
+    taskmgr = Framing(layers=[Signature({'taskmgr': KEY_B})])
+
+    assert end.unwrap(status.wrap(BODY)).principal == 'status'
+    assert end.unwrap(taskmgr.wrap(BODY)).principal == 'taskmgr'
+
+    with pytest.raises(FramingError):
+        end.unwrap(status.wrap(BODY))
+
+
+def test_a_nonce_is_remembered_across_the_generation_roll():
+    """A nonce recorded just before the older generation is retired must
+    still be refused after it, or the window is half what it says."""
+    from tinyrpc.layers import _ReplayCache
+    cache = _ReplayCache(window=0.05, capacity=100)
+
+    assert not cache.seen(b'token')
+    time.sleep(0.06)
+    assert cache.seen(b'token'), "forgotten a whole generation too early"
+    time.sleep(0.12)
+    assert not cache.seen(b'token'), "should age out eventually"
+
+
+def test_ed25519_verifies_when_the_audience_matches():
+    """The negative test alone would pass even if signing quietly left the
+    audience out; this is what says it goes in."""
+    private, public = generate_signing_key()
+    a = Framing(layers=[Ed25519Signature({'gw': public}, signing_key=private,
+                                         audience='status')])
+    b = Framing(layers=[Ed25519Signature({'gw': public}, audience='status')])
+    assert b.unwrap(a.wrap(BODY)).principal == 'gw'
+
+
+def test_ed25519_distinguishes_services_of_equal_name_length():
+    """Only the length is on the wire, so equal-length names must be told
+    apart by the signature itself."""
+    private, public = generate_signing_key()
+    a = Framing(layers=[Ed25519Signature({'gw': public}, signing_key=private,
+                                         audience='aaaaaa')])
+    b = Framing(layers=[Ed25519Signature({'gw': public}, audience='bbbbbb')])
+    with pytest.raises(FramingError) as excinfo:
+        b.unwrap(a.wrap(BODY))
+    assert 'does not match' in str(excinfo.value)
