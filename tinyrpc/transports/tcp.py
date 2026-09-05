@@ -560,16 +560,46 @@ class NonBlockingTcpClientTransport(NonBlockingClientTransport):
                 raise ConnectionError('could not send to %s: %s'
                                       % (self.endpoint, e)) from None
 
+    #: How often a waiter looks up from the queue to ask whether the
+    #: connection it is waiting on is still there.  It does not delay a
+    #: reply, which wakes the wait as soon as it arrives; it bounds only how
+    #: long it takes to notice that none is coming.
+    _liveness_check = 0.25
+
     def receive_reply(self, timeout: Any = None) -> bytes:
         """Return the next reply to arrive, from any outstanding request.
 
         :raises TimeoutError: when nothing arrived within ``timeout``.
+        :raises ConnectionError: when the connection the request went out on
+            died first.  Without this a caller that gave no timeout waits for
+            a reply that provably cannot come -- which is what a held
+            connection makes possible and a per-call one did not, since
+            there the failure surfaced at connect time instead.
         """
-        try:
-            return self.incoming.get(
-                block=True, timeout=timeout if timeout is not None else None)
-        except queue.Empty:
-            raise TimeoutError('no reply within %s seconds' % (timeout,))
+        deadline = None if timeout is None else time.monotonic() + timeout
+        with self._lock:
+            generation, alive = self._generation, self._sock is not None
+        if not alive:
+            raise ConnectionError('not connected to %s' % (self.endpoint,))
+
+        while True:
+            wait = self._liveness_check
+            if deadline is not None:
+                left = deadline - time.monotonic()
+                if left <= 0:
+                    raise TimeoutError('no reply within %s seconds'
+                                       % (timeout,))
+                wait = min(wait, left)
+            try:
+                return self.incoming.get(block=True, timeout=wait)
+            except queue.Empty:
+                with self._lock:
+                    gone = (self._sock is None
+                            or self._generation != generation)
+                if gone:
+                    raise ConnectionError(
+                        'the connection to %s went away while waiting for a '
+                        'reply' % (self.endpoint,)) from None
 
     def send_message(self, message: bytes, expect_reply: bool = True,
                      timeout: Any = None) -> bytes:

@@ -139,6 +139,13 @@ class MultiplexingRPCClient(RPCClient):
             # Nothing waiting.  Note that tinyrpc.exc.TimeoutError derives
             # from the builtin, so this catches whichever the transport uses.
             return
+        except ConnectionError:
+            # The connection went away.  Ordinary for a transport that dials
+            # again on the next send, and not worth a traceback every time
+            # round a loop that polls -- the calls that were in flight
+            # surface as timeouts, which is where the decision to retry
+            # belongs.
+            return
         except Exception:
             self.logger.exception("error reading from transport")
             return
