@@ -104,11 +104,13 @@ def _msgpack_numpy_loads(data: bytes) -> Any:
 #:
 #:     msgpack is compact and fast *when its C extension is installed*, and
 #:     it silently falls back to a pure-Python implementation when it is
-#:     not.  The fallback is roughly ten times slower than :py:mod:`json`
-#:     -- 187us to pack what json writes in 32us -- so a deployment that
-#:     picks msgpack for speed and gets the fallback has chosen the slowest
-#:     option available to it.  ``python -c "import msgpack;
-#:     print(msgpack._cmsgpack)"`` says which one is present.
+#:     not.  On one 120-key mapping the extension packs in 8.2us, the
+#:     fallback in 187us, and :py:mod:`json` in 32us -- so the fallback is
+#:     twenty times slower than the thing it is standing in for and six
+#:     times slower than json, and a deployment that picked msgpack for
+#:     speed and got the fallback chose the slowest option available to it.
+#:     ``python -c "import msgpack; print(msgpack._cmsgpack)"`` says which
+#:     one is present; it raises AttributeError for the fallback.
 SERIALIZERS: Dict[str, Serializer] = {
     'json': Serializer(SERIALIZER_JSON, 'json', _json_dumps, _json_loads),
     'msgpack': Serializer(SERIALIZER_MSGPACK, 'msgpack',
