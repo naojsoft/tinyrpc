@@ -4,12 +4,14 @@
 Defines and implements a concurrent asynchronous server using a
 concurrent.futures.Executor.
 """
-from typing import Any, Callable
-#from concurrent.futures import Executor
+from concurrent.futures import Executor
+from typing import Any, Callable, Optional
 import threading
 
 from . import RPCServer, logger as _server_logger
-from ..transports import TransportTimeout
+from ..dispatch import RPCDispatcher
+from ..protocols import RPCProtocol
+from ..transports import ServerTransport, TransportTimeout
 
 
 class RPCServerExecutor(RPCServer):
@@ -19,8 +21,9 @@ class RPCServerExecutor(RPCServer):
     a concurrent.futures.Executor to spawn new client handlers, resulting
     in asynchronous handling of clients using threads or processes.
     """
-    def __init__(self, transport, protocol, dispatcher,
-                 executor, ev_quit=None):
+    def __init__(self, transport: ServerTransport, protocol: RPCProtocol,
+                 dispatcher: RPCDispatcher, executor: Executor,
+                 ev_quit: Optional[threading.Event] = None) -> None:
         super().__init__(transport, protocol, dispatcher)
 
         self.executor = executor

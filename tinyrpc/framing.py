@@ -17,6 +17,10 @@ all there is, and the body is the payload verbatim -- so an unsecured
 message pays for one ``struct.pack`` and one ``struct.unpack``, about 0.2us
 the pair.  A JSON header of the kind this replaces costs 2.7us and 51 bytes.
 
+:py:class:`Credentials` lives here too.  It is not a :py:class:`Layer` --
+it transforms nothing, it is just carried -- but the section it travels in
+is part of this header, so this is where it belongs.
+
 Layers are applied outward on the way out and unwound on the way in::
 
     payload -> compress -> encrypt -> sign -> header + sections + body
@@ -32,8 +36,10 @@ what is verified is what arrived.
     message that does not meet it, whatever its flags say.
 """
 
+import hmac
 import struct
-from typing import Any, Dict, Optional, Sequence, Tuple
+from typing import (Any, Dict, Optional, Sequence, Tuple,
+                    Union)
 
 MAGIC = b'FX'
 VERSION = 1
@@ -76,6 +82,48 @@ class PolicyError(FramingError):
     only thing standing between a pluggable security layer and a sender that
     simply declares it applied nothing.
     """
+
+
+class Credentials:
+    """A name and a secret, carried in the header's credentials section.
+
+    Not a :py:class:`~tinyrpc.framing.Layer`: it transforms nothing, it is
+    just carried.  A protocol passes it to
+    :py:meth:`~tinyrpc.framing.Framing.wrap` and reads it back out of the
+    metadata on the other side.
+
+    .. warning::
+
+        The secret goes on the wire as it is.  Over a connection nothing else
+        protects, anyone who can see the traffic can reuse it.  Prefer
+        :py:class:`Signature`, or put this inside :py:class:`Encrypt`.
+    """
+
+    __slots__ = ('username', 'password')
+
+    def __init__(self, username: str, password: str) -> None:
+        self.username = username
+        self.password = password
+
+    def encode(self) -> bytes:
+        return b'\x00'.join([self.username.encode('utf-8'),
+                             self.password.encode('utf-8')])
+
+    @classmethod
+    def decode(cls, blob: bytes) -> 'Credentials':
+        try:
+            username, password = blob.split(b'\x00', 1)
+        except ValueError:
+            raise FramingError('malformed credentials') from None
+        return cls(username.decode('utf-8'), password.decode('utf-8'))
+
+    def __eq__(self, other: Any) -> bool:
+        return (isinstance(other, Credentials) and
+                self.username == other.username and
+                hmac.compare_digest(self.password, other.password))
+
+    def __repr__(self) -> str:
+        return "<Credentials %s>" % (self.username,)
 
 
 class Unwrapped:
@@ -141,14 +189,13 @@ class Unwrapped:
         """
         return self.principal is not None
 
-    def credentials(self) -> Optional['Any']:
+    def credentials(self) -> Optional['Credentials']:
         """Decode the claimed credentials, or ``None`` if there were none.
 
         Still a claim.  Checking it is the caller's job.
         """
         if self.claimed_credentials is None:
             return None
-        from .layers import Credentials
         return Credentials.decode(self.claimed_credentials)
 
     def __repr__(self) -> str:
@@ -175,8 +222,8 @@ class Layer:
     section = None
 
     def apply(self, payload: bytes,
-              sign_as: Optional[bytes] = None) -> Tuple[bytes,
-                                                        Optional[bytes]]:
+              sign_as: Optional[Union[bytes, str]] = None
+              ) -> Tuple[bytes, Optional[bytes]]:
         """Transform outgoing bytes.
 
         :param sign_as: Which identity to sign as, when the caller wants a
@@ -243,7 +290,7 @@ class Framing:
     def wrap(self, payload: bytes,
              credentials: Optional[bytes] = None,
              serializer_id: Optional[int] = None,
-             sign_as: Optional[bytes] = None) -> bytes:
+             sign_as: Optional[Union[bytes, str]] = None) -> bytes:
         """Frame a payload for sending.
 
         :param serializer_id: Overrides the default for this message, so a

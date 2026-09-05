@@ -45,7 +45,8 @@ between components that can both be upgraded; XML-RPC remains what keeps
 un-upgraded peers working.
 """
 
-from typing import Any, Callable, Dict, List, Optional, Tuple
+from typing import (Any, Callable, Dict, Generator, List, Optional,
+                    Tuple, Union)
 
 from ..exc import (InvalidParamsError, InvalidReplyError,
                    InvalidRequestError, MethodNotFoundError, RPCError,
@@ -300,7 +301,8 @@ class FlexRPCProtocol(RPCProtocol):
     def __init__(self, serializer: str = DEFAULT_SERIALIZER,
                  framing: Optional[Framing] = None,
                  credentials: Optional[Credentials] = None,
-                 id_generator: Any = None) -> None:
+                 id_generator: Optional[Generator[object, None, None]] = None
+                 ) -> None:
         self.serializer = get_serializer(serializer)
         self.framing = framing if framing is not None else Framing()
         # Every message names its own serializer when it is wrapped, so the
@@ -313,7 +315,7 @@ class FlexRPCProtocol(RPCProtocol):
                              if credentials is not None else None)
         self._id_generator = id_generator or default_id_generator()
 
-    def _get_unique_id(self) -> Any:
+    def _get_unique_id(self) -> object:
         return next(self._id_generator)
 
     def request_factory(self) -> FlexRPCRequest:
@@ -413,7 +415,9 @@ class FlexRPCProtocol(RPCProtocol):
         request._credentials = None
         return request
 
-    def parse_reply(self, data: bytes) -> RPCResponse:
+    def parse_reply(
+            self, data: bytes
+    ) -> Union['FlexRPCResponse', 'FlexRPCErrorResponse']:
         """Reconstruct a reply from the wire.
 
         The reply carries the id of the request it answers, which is what
@@ -445,7 +449,7 @@ class FlexRPCProtocol(RPCProtocol):
 
         raise InvalidReplyError('expected a reply, got %r' % (kind,))
 
-    def raise_error(self, error: FlexRPCErrorResponse) -> RPCError:
+    def raise_error(self, error: 'FlexRPCErrorResponse') -> 'FlexRPCError':
         """Turn an error reply back into an exception for the caller."""
         exception = FlexRPCError(
             error.error,

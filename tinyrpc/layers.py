@@ -9,10 +9,11 @@ so that what is verified is what actually arrived.
 Authentication comes in two shapes here, and they answer different
 questions:
 
-* :py:class:`Credentials` carries a name and a secret, saying *who* the
-  caller claims to be.  It is what HTTP Basic authentication does, and what
-  Gen2's ``authDict`` expects -- but it sends a reusable secret, so it is
-  only as private as the connection.
+* :py:class:`~tinyrpc.framing.Credentials` carries a name and a secret,
+  saying *who* the caller claims to be.  It is what HTTP Basic
+  authentication does -- but it sends a reusable secret, so it is only as
+  private as the connection.  It lives with the envelope rather than here,
+  because it transforms nothing and so is not a layer at all.
 * :py:class:`Signature` proves the sender holds a particular key, without
   sending it, and detects any change to the message on the way.  Keys have
   names, so with a key per service a verified message says which service
@@ -32,7 +33,13 @@ import zlib
 from typing import Any, Dict, Mapping, Optional, Tuple, Union
 
 from .framing import (FLAG_COMPRESSED, FLAG_ENCRYPTED, FLAG_SIGNED,
-                      FramingError, Layer, Unwrapped)
+                      Credentials, FramingError, Layer, Unwrapped)
+
+# Credentials lives with the envelope rather than here: it transforms
+# nothing, so it is not a Layer, and the header section it travels in is
+# defined there.  Re-exported because this is where it used to be.
+__all__ = ['Credentials', 'Deflate', 'Ed25519Signature', 'Encrypt',
+           'Signature', 'derive_key', 'generate_signing_key']
 
 
 def _as_bytes(value: Union[bytes, str]) -> bytes:
@@ -59,8 +66,8 @@ class Deflate(Layer):
         self.threshold = threshold
 
     def apply(self, payload: bytes,
-              sign_as: Optional[bytes] = None) -> Tuple[bytes,
-                                                        Optional[bytes]]:
+              sign_as: Optional[Union[bytes, str]] = None
+              ) -> Tuple[bytes, Optional[bytes]]:
         if len(payload) < self.threshold:
             return zlib.compress(payload, 0), None
         return zlib.compress(payload, self.level), None
@@ -188,7 +195,7 @@ class Signature(Layer):
 
     def __init__(self,
                  keys: Union[bytes, str, Mapping[str, Any]],
-                 sign_as: Optional[str] = None,
+                 sign_as: Optional[Union[bytes, str]] = None,
                  digest: str = 'sha256',
                  max_age: Optional[float] = 300.0,
                  audience: Optional[str] = None,
@@ -265,8 +272,8 @@ class Signature(Layer):
     # -------------------------------------------------------------------
 
     def apply(self, payload: bytes,
-              sign_as: Optional[bytes] = None) -> Tuple[bytes,
-                                                        Optional[bytes]]:
+              sign_as: Optional[Union[bytes, str]] = None
+              ) -> Tuple[bytes, Optional[bytes]]:
         if sign_as is None:
             key_id, key = self._sign_as, self._sign_key
         else:
@@ -355,9 +362,10 @@ class Ed25519Signature(Signature):
     :param keys: The public keys this end accepts, as ``{key_id: public}``
         or ``{key_id: (public, principal)}``, each 32 bytes.
     :param sign_as: Which id this end signs as.  Needed only when it signs.
-    :param signing_key: This end's own 32-byte private key, or ``None`` for
-        an end that only verifies -- a monitor, or a name service that
-        should not be able to speak for what it registers.
+    :param signing_key: This end's own 32-byte private key, or an already
+        built :py:class:`nacl.signing.SigningKey`, or ``None`` for an end
+        that only verifies -- a monitor, or a name service that should not
+        be able to speak for what it registers.
     :param max_age: As :py:class:`Signature`.
     :param audience: As :py:class:`Signature`.
     :param replay_cache: As :py:class:`Signature`.
@@ -365,8 +373,8 @@ class Ed25519Signature(Signature):
 
     def __init__(self,
                  keys: Mapping[str, Any],
-                 sign_as: Optional[str] = None,
-                 signing_key: Optional[bytes] = None,
+                 sign_as: Optional[Union[bytes, str]] = None,
+                 signing_key: Optional[Any] = None,
                  max_age: Optional[float] = 300.0,
                  audience: Optional[str] = None,
                  replay_cache: int = 0) -> None:
@@ -472,8 +480,8 @@ class Encrypt(Layer):
         self._nonce_size = SecretBox.NONCE_SIZE
 
     def apply(self, payload: bytes,
-              sign_as: Optional[bytes] = None) -> Tuple[bytes,
-                                                        Optional[bytes]]:
+              sign_as: Optional[Union[bytes, str]] = None
+              ) -> Tuple[bytes, Optional[bytes]]:
         nonce = os.urandom(self._nonce_size)
         return self._box.encrypt(payload, nonce).ciphertext, nonce
 
@@ -498,45 +506,3 @@ def derive_key(passphrase: str, salt: bytes = b'tinyrpc-flexrpc',
     """
     return hashlib.pbkdf2_hmac('sha256', passphrase.encode('utf-8'),
                                salt, 200000, dklen=length)
-
-
-class Credentials:
-    """A name and a secret, carried in the header's credentials section.
-
-    Not a :py:class:`~tinyrpc.framing.Layer`: it transforms nothing, it is
-    just carried.  A protocol passes it to
-    :py:meth:`~tinyrpc.framing.Framing.wrap` and reads it back out of the
-    metadata on the other side.
-
-    .. warning::
-
-        The secret goes on the wire as it is.  Over a connection nothing else
-        protects, anyone who can see the traffic can reuse it.  Prefer
-        :py:class:`Signature`, or put this inside :py:class:`Encrypt`.
-    """
-
-    __slots__ = ('username', 'password')
-
-    def __init__(self, username: str, password: str) -> None:
-        self.username = username
-        self.password = password
-
-    def encode(self) -> bytes:
-        return b'\x00'.join([self.username.encode('utf-8'),
-                             self.password.encode('utf-8')])
-
-    @classmethod
-    def decode(cls, blob: bytes) -> 'Credentials':
-        try:
-            username, password = blob.split(b'\x00', 1)
-        except ValueError:
-            raise FramingError('malformed credentials') from None
-        return cls(username.decode('utf-8'), password.decode('utf-8'))
-
-    def __eq__(self, other: Any) -> bool:
-        return (isinstance(other, Credentials) and
-                self.username == other.username and
-                hmac.compare_digest(self.password, other.password))
-
-    def __repr__(self) -> str:
-        return "<Credentials %s>" % (self.username,)

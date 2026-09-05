@@ -114,7 +114,7 @@ class RPCServer(object):
     def __init__(
             self, transport: ServerTransport, protocol: RPCProtocol,
             dispatcher: RPCDispatcher
-    ):
+    ) -> None:
         self.transport = transport
         self.protocol = protocol
         self.dispatcher = dispatcher
@@ -251,7 +251,7 @@ class AsyncioRPCServer(RPCServer):
     def __init__(
             self, transport: ServerTransport, protocol: RPCProtocol,
             dispatcher: RPCDispatcher, executor: Any = None
-    ):
+    ) -> None:
         super().__init__(transport, protocol, dispatcher)
 
         self.executor = executor

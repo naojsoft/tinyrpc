@@ -3,7 +3,7 @@
 
 from __future__ import absolute_import  # needed for zmq import
 
-from typing import Tuple, Any, Dict
+from typing import Tuple, Any, Callable
 
 import queue as _queue
 import socket as _socket
@@ -228,7 +228,8 @@ class ZmqClientTransport(ClientTransport):
     :param timeout: Seconds to wait for a reply.
     """
 
-    def __init__(self, socket_factory, timeout: float = None) -> None:
+    def __init__(self, socket_factory: Callable[[], 'zmq.Socket'],
+                 timeout: float = None) -> None:
         self._make_socket = socket_factory
         self.timeout = timeout
         self._local = threading.local()

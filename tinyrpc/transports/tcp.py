@@ -31,7 +31,7 @@ class ConnectionlessTcpClientTransport(ClientTransport):
     def __init__(self, endpoint: tuple[str, int],
                  packer: Any = None,
                  timeout: Any = None,
-                 **kwargs) -> None:
+                 **kwargs: Any) -> None:
         self.endpoint = endpoint
         self.timeout = timeout
         if packer is None:
@@ -580,7 +580,7 @@ class TransportPacker:
     limited to sending and receiving packets of `chunk_size`.
     """
 
-    def __init__(self):
+    def __init__(self) -> None:
         self.version = b'1.0'
         self.chunk_size = 4096
 
@@ -610,7 +610,7 @@ class TransportPackerRobust(TransportPacker):
     size of the packet can be known and received more robustly.
     """
 
-    def __init__(self):
+    def __init__(self) -> None:
         super().__init__()
         self.version = b'1.0'
         self.rpc_hdr_len = 32
