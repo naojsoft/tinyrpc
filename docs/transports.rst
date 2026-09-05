@@ -17,13 +17,33 @@ strings. All transports need to support two different interfaces:
     :show-inheritance:
     :member-order: bysource
 
+.. autoclass:: tinyrpc.transports.NonBlockingClientTransport
+    :members:
+    :noindex:
+    :show-inheritance:
+    :member-order: bysource
+
+.. autoexception:: tinyrpc.transports.TransportTimeout
+    :show-inheritance:
+
 Note that these transports are of relevance when using ``tinyrpc``-built in
 facilities. They can be coopted for any other purpose, if you simply need
 reliable server-client message passing as well.
 
-Also note that the client transport interface is not designed for asynchronous
-use. For simple use cases (sending multiple concurrent requests) monkey patching
-with gevent may get the job done.
+A client transport blocks by default: it sends, and waits for the reply. Three
+things exist for when that is not what you want.
+:py:class:`~tinyrpc.transports.NonBlockingClientTransport` splits sending from
+collecting, which is what
+:py:class:`~tinyrpc.client_multiplexing.MultiplexingRPCClient` uses to keep
+several calls in flight over one connection. The ``Asyncio*`` transports below
+are the same idea for code that is already using :py:mod:`asyncio`. And monkey
+patching with gevent still works for simple cases.
+
+A server transport that blocks forever waiting for the next request cannot be
+shut down, because setting an event does nothing until a request happens to
+arrive. Transports that poll raise
+:py:exc:`~tinyrpc.transports.TransportTimeout` instead, which is how a serve
+loop gets the chance to notice it has been asked to stop.
 
 
 Transport implementations
@@ -51,7 +71,22 @@ Based on :py:mod:`zmq`, supports 0mq based sockets. Highly recommended:
 HTTP
 ~~~~
 
-There is only an HTTP client, no server (use WSGI instead).
+.. autoclass:: tinyrpc.transports.http_server.HttpServerTransport
+    :members:
+    :noindex:
+    :show-inheritance:
+    :member-order: bysource
+
+.. autoclass:: tinyrpc.transports.http_client.HttpClientTransport
+    :members:
+    :noindex:
+    :show-inheritance:
+    :member-order: bysource
+
+:py:class:`~tinyrpc.transports.http.HttpPostClientTransport` is the older client,
+built on :py:mod:`requests`. It still works; ``HttpClientTransport`` above uses
+:py:mod:`http.client` from the standard library instead, which needs no
+dependency and costs about a millisecond less per call.
 
 .. autoclass:: tinyrpc.transports.http.HttpPostClientTransport
     :members:
@@ -66,6 +101,64 @@ There is only an HTTP client, no server (use WSGI instead).
 
     It will result in a ``requests.exceptions.Timeout`` exception when a
     timeout occurs.
+
+TCP
+~~~
+
+A protocol carried straight over a socket, with no HTTP framing. Cheaper per
+call than the HTTP carrier; it cannot carry an HTTP header, so a protocol
+needing to identify its caller over one wants :doc:`framing`.
+
+Messages are length-prefixed by :py:class:`~tinyrpc.transports.tcp.TransportPackerRobust`,
+so a message larger than one read arrives whole and two small ones do not arrive
+as one.
+
+.. autoclass:: tinyrpc.transports.tcp.ConnectionlessTcpServerTransport
+    :members:
+    :noindex:
+    :show-inheritance:
+    :member-order: bysource
+
+.. autoclass:: tinyrpc.transports.tcp.ConnectionlessTcpClientTransport
+    :members:
+    :noindex:
+    :show-inheritance:
+    :member-order: bysource
+
+The connectionless pair dials once per call, which is what lets a client and a
+service be restarted in any order: there is no held connection to go stale. The
+pair below holds one open, which is cheaper per call and the only shape that can
+multiplex -- in exchange the connection can die, so the client dials again.
+
+.. autoclass:: tinyrpc.transports.tcp.TcpServerTransport
+    :members:
+    :noindex:
+    :show-inheritance:
+    :member-order: bysource
+
+.. autoclass:: tinyrpc.transports.tcp.NonBlockingTcpClientTransport
+    :members:
+    :noindex:
+    :show-inheritance:
+    :member-order: bysource
+
+asyncio
+~~~~~~~
+
+.. autoclass:: tinyrpc.transports.tcp.AsyncioTcpServerTransport
+    :members:
+    :noindex:
+    :show-inheritance:
+    :member-order: bysource
+
+.. autoclass:: tinyrpc.transports.tcp.AsyncioTcpClientTransport
+    :members:
+    :noindex:
+    :show-inheritance:
+    :member-order: bysource
+
+Served by :py:class:`~tinyrpc.server.AsyncioRPCServer`, which awaits a handler
+that returns a coroutine and can hand a blocking one to an executor.
 
 WSGI
 ~~~~

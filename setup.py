@@ -26,6 +26,7 @@ setup(
         'gevent': ['gevent'],
         'httpclient': ['requests', 'websocket-client', 'gevent-websocket'],
         'msgpack': ['msgpack'],
+        'nacl': ['pynacl'],
         'websocket': ['gevent-websocket'],
         'wsgi': ['werkzeug'],
         'zmq': ['pyzmq'],

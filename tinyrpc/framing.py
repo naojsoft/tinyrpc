@@ -55,6 +55,17 @@ FLAG_ENCRYPTED = 0x02
 FLAG_SIGNED = 0x04
 FLAG_CREDENTIALS = 0x08
 
+#: Flags whose layer *changes* the payload, rather than merely adding a
+#: section beside it.
+#:
+#: A receiver that cannot undo one of these has to refuse the message:
+#: handing back a body it never decompressed or decrypted is worse than
+#: saying it cannot read it, because the caller has no way to tell.  A
+#: signature it cannot check is a different matter -- the body is intact,
+#: it is only unverified -- and ``require`` is how a receiver says it will
+#: not stand for that.
+TRANSFORMING = FLAG_COMPRESSED | FLAG_ENCRYPTED
+
 #: Sections, in the order they are written.  Each is a 2-byte length
 #: followed by that many bytes.
 SECTION_ORDER = [
@@ -356,6 +367,16 @@ class Framing:
         if missing:
             raise PolicyError(
                 'message is missing required protection 0x%02x' % (missing,))
+
+        # Refusing beats returning a payload we did not undo.  Only the
+        # layers that transform one matter here; an unverifiable signature
+        # leaves the body readable, and `require` covers whether that is
+        # acceptable.
+        cannot_undo = flags & TRANSFORMING & ~self._flags
+        if cannot_undo:
+            raise FramingError(
+                'message is transformed 0x%02x and this end has no layer '
+                'that undoes it' % (cannot_undo,))
 
         offset = HEADER_LEN
         sections: Dict[str, bytes] = {}

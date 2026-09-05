@@ -153,10 +153,18 @@ class RPCServer(object):
         # long as its immutable
 
         def handle_message(context: Any, message: bytes) -> None:
-            """Parse, process and reply a single request."""
+            """Parse, process and reply to a single request.
+
+            Parsing happens exactly once.  It used to happen twice -- once
+            here and once in the wrapper below, so that a failure had a
+            request to answer with -- which doubled the cost of decoding and
+            of verifying a signature, and was fatal to a protocol that
+            refuses a message it has already seen: the second parse looked
+            exactly like a replay of the first.
+            """
+            request = None
             try:
                 request = self.protocol.parse_request(message)
-                #print(f"received {request.unique_id}")
             except tinyrpc.exc.RPCError as e:
                 response = e.error_respond()
             else:
@@ -174,33 +182,26 @@ class RPCServer(object):
                         request, getattr(self.protocol, '_caller', None)
                     )
 
-            # send reply
-            if response is not None:
-                result = response.serialize()
-                #print(f"reply {response.unique_id}")
-                if callable(self.trace):
-                    self.trace('<--', context, result)
-                self.transport.send_reply(context, result)
+            try:
+                if response is not None:
+                    result = response.serialize()
+                    if callable(self.trace):
+                        self.trace('<--', context, result)
+                    self.transport.send_reply(context, result)
+            except Exception as e:
+                # Serializing a response can raise -- a result the protocol
+                # cannot encode is the usual way -- and so can the transport.
+                # Without this, such a failure sent no reply and logged
+                # nothing, so the caller waited out its timeout with no idea
+                # why.
+                self._report_failure(context, request, e)
 
         def guarded(context: Any, message: bytes) -> None:
-            """Run the handler, and answer even if it fails.
-
-            Serializing a response can raise -- a result the protocol cannot
-            encode is the usual way -- and so can a protocol that reports a
-            malformed request with something other than an RPCError.  Without
-            this, such a failure sent no reply and logged nothing, so the
-            caller waited out its timeout with no idea why.
-            """
-            request = None
-            try:
-                request = self.protocol.parse_request(message)
-            except Exception:
-                pass                    # handle_message reports this properly
-
+            """Answer even if handling blew up somewhere unforeseen."""
             try:
                 handle_message(context, message)
             except Exception as e:
-                self._report_failure(context, request, e)
+                self._report_failure(context, None, e)
 
         self._spawn(guarded, context, message)
 
@@ -308,36 +309,35 @@ class AsyncioRPCServer(RPCServer):
         # long as its immutable
 
         async def handle_message(context: Any, message: bytes) -> None:
-            """Parse, process and reply a single request."""
+            """Parse, process and reply to a single request.
+
+            Parsed exactly once, for the reasons given on the synchronous
+            server: parsing twice doubles the work and looks like a replay
+            to a protocol that watches for one.
+            """
+            request = None
             try:
                 request = self.protocol.parse_request(message)
-                #print(f"received {request.unique_id}")
             except tinyrpc.exc.RPCError as e:
                 response = e.error_respond()
             else:
                 response = await self._dispatch(request)
 
-            # send reply
-            if response is not None:
-                result = response.serialize()
-                #print(f"reply {response.unique_id}")
-                if callable(self.trace):
-                    self.trace('<--', context, result)
-                await self.transport.send_reply(context, result)
+            try:
+                if response is not None:
+                    result = response.serialize()
+                    if callable(self.trace):
+                        self.trace('<--', context, result)
+                    await self.transport.send_reply(context, result)
+            except Exception as e:
+                await self._report_failure_async(context, request, e)
 
         async def guarded(context: Any, message: bytes) -> None:
-            """As for the synchronous server: answer even if the handler
-            fails, rather than leaving the caller to time out."""
-            request = None
-            try:
-                request = self.protocol.parse_request(message)
-            except Exception:
-                pass
-
+            """Answer even if handling blew up somewhere unforeseen."""
             try:
                 await handle_message(context, message)
             except Exception as e:
-                await self._report_failure_async(context, request, e)
+                await self._report_failure_async(context, None, e)
 
         self._spawn(guarded, context, message)
 

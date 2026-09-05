@@ -21,6 +21,7 @@ from concurrent.futures import ThreadPoolExecutor
 
 import pytest
 
+import tinyrpc.exc
 from tinyrpc.dispatch import RPCDispatcher
 from tinyrpc.protocols.jsonrpc import JSONRPCProtocol
 from tinyrpc.server import AsyncioRPCServer
@@ -199,3 +200,64 @@ def test_the_asyncio_server_still_answers_an_ordinary_call():
             task.cancel()
 
     assert asyncio.run(main()) == 'hi'
+
+
+# ------------------------------------------------------- parsed once --
+
+class CountingProtocol(JSONRPCProtocol):
+    """Counts parses, and refuses a message it has already seen -- which is
+    what a replay cache does."""
+
+    def __init__(self, refuse_repeats=False):
+        super().__init__()
+        self.parses = 0
+        self.seen = set()
+        self.refuse_repeats = refuse_repeats
+
+    def parse_request(self, data):
+        self.parses += 1
+        if self.refuse_repeats and data in self.seen:
+            raise tinyrpc.exc.InvalidRequestError(
+                'this message has already been delivered')
+        self.seen.add(data)
+        return super().parse_request(data)
+
+
+def run_one(protocol, method='echo', args=('hi',)):
+    request = protocol.create_request(method, list(args), None)
+    transport = OneShotTransport(request.serialize())
+    executor = ThreadPoolExecutor(max_workers=2)
+    server = RPCServerExecutor(transport, protocol, make_dispatcher(),
+                               executor, ev_quit=threading.Event())
+    server.start()
+    try:
+        transport.delivered.wait(timeout=10)
+    finally:
+        server.stop()
+        executor.shutdown(wait=False)
+    return transport
+
+
+def test_a_request_is_parsed_exactly_once():
+    """Regression.  It was parsed twice -- once to handle it, and once
+    speculatively so that a failure would have a request to answer with --
+    which doubles the cost of decoding and of verifying a signature."""
+    protocol = CountingProtocol()
+    run_one(protocol)
+    assert protocol.parses == 1, "parsed %d times" % (protocol.parses,)
+
+
+def test_a_protocol_that_refuses_repeats_still_works():
+    """The same bug, in the form that made it fatal rather than wasteful: to
+    a protocol with a replay cache, the second parse of a message looks
+    exactly like a replay of the first, so every single call failed."""
+    protocol = CountingProtocol(refuse_repeats=True)
+    transport = run_one(protocol)
+
+    assert transport.replies, "no reply at all"
+    protocol.raises_errors = False
+    response = protocol.parse_reply(transport.replies[0])
+    assert not getattr(response, 'error', None), \
+        "a first, legitimate call was refused as a repeat: %r" % (
+            getattr(response, 'error', None),)
+    assert response.result == 'hi'

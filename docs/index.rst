@@ -10,6 +10,12 @@ Although its initial scope is handling jsonrpc_ it is easy to add further protoc
 add additional transports (one such example is msgpackrpc_, which is now fully supported).
 If so desired it is even possible to replace the default method dispatcher.
 
+There is an optional fourth component, :doc:`framing`, sitting between the protocol and
+the transport: it is where compression, encryption and authentication live, so that a
+protocol need not invent any of them and a transport need not carry them. :doc:`flexrpc`
+is a protocol built on it, whose encoding and protection are both parameters rather than
+part of its definition.
+
 
 Table of contents
 -----------------
@@ -23,6 +29,8 @@ Table of contents
     protocols
     jsonrpc
     msgpackrpc
+    framing
+    flexrpc
     transports
     client
     server

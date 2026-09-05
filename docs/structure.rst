@@ -45,6 +45,21 @@ The protocol class(es) are responsible for two tasks:
 * they serialize the requests and responses into messages and deserialize messages back into requests and responses.
 
 
+Framing
+-------
+
+Between the protocol and the transport there is an optional fourth layer.
+Compression, encryption and authentication all transform the bytes of a message
+and all need a little metadata carried alongside, so :doc:`framing` gives them
+one envelope to share rather than letting each invent a wrapper.
+
+It is optional in the strict sense: the protocols that predate it do not use it,
+and a protocol that does can still be handed a :py:class:`~tinyrpc.framing.Framing`
+with no layers, which costs one ``struct`` call in each direction. What it buys is
+that a new way of protecting messages is written once and works for every protocol
+built on it, and that a receiver can *require* protection rather than trusting a
+sender's word that it applied some.
+
 Dispatcher
 ----------
 

@@ -750,3 +750,41 @@ def test_ed25519_distinguishes_services_of_equal_name_length():
     with pytest.raises(FramingError) as excinfo:
         b.unwrap(a.wrap(BODY))
     assert 'does not match' in str(excinfo.value)
+
+
+# ------------------------------------------ what this end cannot undo --
+
+def test_a_body_this_end_cannot_decompress_is_refused():
+    """Regression.  unwrap() walked the layers it *had* and ignored the flags
+    it did not, so a receiver missing Deflate handed back a payload still
+    compressed -- as if it were the body, with nothing to say otherwise."""
+    sender = Framing(layers=[Deflate(threshold=0)])
+    receiver = Framing()
+
+    with pytest.raises(FramingError) as excinfo:
+        receiver.unwrap(sender.wrap(BODY))
+    assert 'no layer' in str(excinfo.value)
+
+
+def test_a_body_this_end_cannot_decrypt_is_refused():
+    sender = Framing(layers=[Encrypt(KEY)])
+    with pytest.raises(FramingError):
+        Framing().unwrap(sender.wrap(BODY))
+
+
+def test_a_signature_this_end_cannot_check_is_not_an_error():
+    """Different case, and deliberately so: the body is intact, it is only
+    unverified.  Whether that is acceptable is what `require` decides, so a
+    receiver that asks for nothing gets the message."""
+    signed = Framing(layers=[Signature(KEY_A)])
+    lax = Framing()
+
+    got = lax.unwrap(signed.wrap(BODY))
+    assert got.payload == BODY
+    assert got.principal is None, "and it knows it proved nothing"
+
+
+def test_a_receiver_that_requires_a_signature_still_refuses_one():
+    strict = Framing(layers=[Signature(KEY_A)], require=FLAG_SIGNED)
+    with pytest.raises(PolicyError):
+        strict.unwrap(Framing().wrap(BODY))

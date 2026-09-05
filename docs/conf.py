@@ -251,12 +251,14 @@ texinfo_documents = [
 
 
 # Example configuration for intersphinx: refer to the Python standard library.
+# Sphinx 5 made the keys names rather than URLs, and rejects the old shape
+# outright -- which is why these docs would not build at all.
 intersphinx_mapping = {
-    'https://docs.python.org/3/': None,
-    'https://pyzmq.readthedocs.io/en/latest/': None,
-    'http://docs.python-requests.org/en/latest/': None,
-    'http://werkzeug.pocoo.org/docs/': None,
-    'http://www.gevent.org/': None,
+    'python': ('https://docs.python.org/3/', None),
+    'pyzmq': ('https://pyzmq.readthedocs.io/en/latest/', None),
+    'requests': ('https://requests.readthedocs.io/en/latest/', None),
+    'werkzeug': ('https://werkzeug.palletsprojects.com/en/stable/', None),
+    'gevent': ('https://www.gevent.org/', None),
 }
 
 autoclass_content = "both"
