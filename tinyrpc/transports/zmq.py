@@ -47,6 +47,12 @@ class ZmqServerTransport(ServerTransport):
         self._wake_r.setblocking(False)
         self._ev_quit = threading.Event()
         self._thread = None
+        # Whether a socket thread was ever started.  stop() clears _thread,
+        # so _thread being None cannot tell "never started" apart from
+        # "another stop is already handling it", and the two want opposite
+        # things: the first must close the socket itself, the second must
+        # leave it alone.
+        self._started = False
         self._shut = False
         self._lifecycle = threading.Lock()
 
@@ -58,6 +64,7 @@ class ZmqServerTransport(ServerTransport):
             self._thread = threading.Thread(target=self._serve_socket,
                                             name='zmq-transport')
             self._thread.daemon = True
+            self._started = True
             self._thread.start()
 
     def stop(self) -> None:
@@ -70,10 +77,15 @@ class ZmqServerTransport(ServerTransport):
 
         with self._lifecycle:
             thread, self._thread = self._thread, None
+            started = self._started
         if thread is not None:
             thread.join(timeout=5.0)
-        else:
-            # Never started, so nobody else will close the socket.
+        elif not started:
+            # Never started, so nobody else will close the socket.  When it
+            # *was* started, another stop() already took the thread and is
+            # joining it; closing here would pull the socket out from under
+            # a poll still running on it, which 0mq reports as "Socket
+            # operation on non-socket" from a thread nobody is watching.
             self._close()
 
     def _close(self) -> None:
