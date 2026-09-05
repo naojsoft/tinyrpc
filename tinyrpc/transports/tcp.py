@@ -35,7 +35,7 @@ class ConnectionlessTcpClientTransport(ClientTransport):
         self.endpoint = endpoint
         self.timeout = timeout
         if packer is None:
-            packer = TransportPackerRobust()
+            packer = default_packer()
         self.packer = packer
 
     def send_message(self, message: bytes, expect_reply: bool = True,
@@ -82,7 +82,7 @@ class ConnectionlessTcpServerTransport(ServerTransport):
                  ) -> None:
         self.sock = sock
         if packer is None:
-            packer = TransportPackerRobust()
+            packer = default_packer()
         self.packer = packer
         self.poll_timeout = poll_timeout
         self.read_timeout = read_timeout
@@ -227,7 +227,7 @@ class TcpClientTransport(ClientTransport):
                  packer: Any = None) -> None:
         self.endpoint = endpoint
         if packer is None:
-            packer = TransportPackerRobust()
+            packer = default_packer()
         self.packer = packer
         self.connect()
 
@@ -290,7 +290,7 @@ class TcpServerTransport(ServerTransport):
                  logger: Any = None) -> None:
         self.sock = sock
         if packer is None:
-            packer = TransportPackerRobust()
+            packer = default_packer()
         self.packer = packer
         self.poll_timeout = poll_timeout
         self.logger = logger
@@ -447,7 +447,7 @@ class NonBlockingTcpClientTransport(NonBlockingClientTransport):
         self.reconnect_interval = reconnect_interval
         self.logger = logger
         if packer is None:
-            packer = TransportPackerRobust()
+            packer = default_packer()
         self.packer = packer
 
         self.incoming = queue.Queue()
@@ -723,6 +723,31 @@ class TransportPackerRobust(TransportPacker):
         return msg
 
 
+
+def default_packer() -> TransportPacker:
+    """The framing a threaded TCP transport uses when given no packer.
+
+    One decision in one place, because it has to be the same at both ends of
+    a connection and there is no way for either to find out what the other
+    chose.  Seven ``__init__`` methods each naming a class independently is
+    how a client and its server came to disagree once already: the server was
+    moved to the length-prefixed packer and the client was left behind, and
+    a framing mismatch does not raise -- it times out.
+
+    Pass ``packer=TransportPacker()`` to both ends instead to speak the
+    unframed wire format that standard msgpack-RPC over TCP uses.  That is
+    supported on servers as well as clients; the limit is that a message
+    larger than one read arrives in pieces, which is what the prefix exists
+    to fix.
+    """
+    return TransportPackerRobust()
+
+
+def default_asyncio_packer() -> 'AsyncioTransportPacker':
+    """As :py:func:`default_packer`, for the asyncio transports."""
+    return AsyncioTransportPackerRobust()
+
+
 class AsyncioTcpClientTransport(ClientTransport):
     """An asyncio TCP client, holding its connection open.
 
@@ -743,7 +768,7 @@ class AsyncioTcpClientTransport(ClientTransport):
         self.endpoint = endpoint
         self.timeout = timeout
         if packer is None:
-            packer = AsyncioTransportPackerRobust()
+            packer = default_asyncio_packer()
         self.packer = packer
         self.reader = None
         self.writer = None
@@ -817,7 +842,7 @@ class AsyncioTcpServerTransport(ServerTransport):
         self.logger = logger
         self.incoming = asyncio.Queue()
         if packer is None:
-            packer = AsyncioTransportPackerRobust()
+            packer = default_asyncio_packer()
         self.packer = packer
         self._server = None
 

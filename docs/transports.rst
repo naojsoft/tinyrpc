@@ -142,10 +142,38 @@ multiplex -- in exchange the connection can die, so the client dials again.
     :show-inheritance:
     :member-order: bysource
 
-.. note:: The length prefix is a ``tinyrpc`` extension. Standard msgpack-RPC
-    over TCP has none -- the msgpack stream is self-delimiting -- so a peer
-    that is not ``tinyrpc`` sees the prefix as a malformed message and answers
-    nothing. Pass ``packer=TransportPacker()`` to talk to one.
+Framing, and talking to something that is not tinyrpc
++++++++++++++++++++++++++++++++++++++++++++++++++++++
+
+The packer *is* the wire format, on a server exactly as on a client. Both ends
+have to be given the same one, and neither can find out what the other chose --
+a mismatch does not raise, it times out.
+
+The default, :py:func:`~tinyrpc.transports.tcp.default_packer`, prefixes each
+message with its length. That prefix is a ``tinyrpc`` extension: standard
+msgpack-RPC over TCP has none, because the msgpack stream is self-delimiting.
+To speak the standard format, say so at both ends:
+
+.. code-block:: python
+
+    from tinyrpc.transports.tcp import (TcpServerTransport,
+                                        TcpClientTransport, TransportPacker)
+
+    server = TcpServerTransport(sock, packer=TransportPacker())
+    client = TcpClientTransport((host, port), packer=TransportPacker())
+
+That works for every transport here, connectionless or stateful. What it costs
+is the reason the prefix is the default: without a length there is nothing to
+say where a message ends, so the protocol is handed whatever one ``recv()``
+returned. Messages that fit in one read are fine -- which is most RPC traffic,
+and why the unframed format works at all -- and a larger one arrives in pieces
+and fails to parse.
+
+:py:class:`~tinyrpc.transports.tcp.AsyncTcpClientTransport` is the one
+transport whose default is unframed, because that is what it always was and
+what its callers talk to.
+
+.. autofunction:: tinyrpc.transports.tcp.default_packer
 
 .. autoclass:: tinyrpc.transports.tcp.AsyncTcpClientTransport
     :members:
