@@ -1,7 +1,7 @@
 #!/usr/bin/env python
 # -*- coding: utf-8 -*-
 
-from typing import Tuple, Any
+from typing import Tuple, Any, Optional
 from types import SimpleNamespace
 import socket
 import threading
@@ -203,10 +203,23 @@ class ConnectionlessTcpServerTransport(ServerTransport):
 
 
 class TcpClientTransport(ClientTransport):
-    """
-    NOTE: (from the base class doc)
-    Also note that the client transport interface is not designed for
-    asynchronous use. This means each thread should make their own client.
+    """A client that connects once and then blocks on each call.
+
+    The plain counterpart to :py:class:`TcpServerTransport`: one connection,
+    one call at a time.  :py:class:`NonBlockingTcpClientTransport` is the
+    same connection used by a multiplexing client, and reconnects when it
+    drops; this one does neither, so it suits a caller that wants a socket
+    and nothing clever.
+
+    The transport interface is not designed for concurrent use, so each
+    thread should make its own.
+
+    :param endpoint: ``(host, port)`` to connect to.
+    :param packer: Framing.  The default is length-prefixed
+        (:py:class:`TransportPackerRobust`), which is what
+        :py:class:`TcpServerTransport` expects.  Pass
+        ``packer=TransportPacker()`` for a peer that is not ``tinyrpc``:
+        standard msgpack-RPC over TCP has no length prefix.
     """
 
     def __init__(self,
@@ -214,7 +227,7 @@ class TcpClientTransport(ClientTransport):
                  packer: Any = None) -> None:
         self.endpoint = endpoint
         if packer is None:
-            packer = TransportPacker()
+            packer = TransportPackerRobust()
         self.packer = packer
         self.connect()
 
@@ -222,14 +235,28 @@ class TcpClientTransport(ClientTransport):
         self.sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         self.sock.connect(self.endpoint)
 
-    def send_message(self, message: bytes, expect_reply: bool =True) -> bytes:
+    def send_message(self, message: bytes, expect_reply: bool = True,
+                     timeout: Any = None) -> bytes:
+        # RPCClient.call() passes whatever it was given straight through, so
+        # a transport that does not take `timeout` turns client.call(...,
+        # timeout=5) into a TypeError rather than a timeout.
+        if timeout is not None:
+            self.sock.settimeout(timeout)
         self.packer.send(self.sock, message)
         if expect_reply:
             try:
                 recv_data = self.packer.recv(self.sock)
-            except ConnectionError as e:
+            except ConnectionError:
                 recv_data = b''
             return recv_data
+
+    def close(self) -> None:
+        sock, self.sock = getattr(self, 'sock', None), None
+        if sock is not None:
+            try:
+                sock.close()
+            except OSError:
+                pass
 
 
 class TcpServerTransport(ServerTransport):
@@ -739,13 +766,25 @@ class AsyncioTcpClientTransport(ClientTransport):
                 pass
 
     async def send_message(self, message: bytes,
-                           expect_reply: bool = True) -> bytes:
+                           expect_reply: bool = True,
+                           timeout: Optional[float] = None) -> bytes:
+        """Send a message and, unless told not to, wait for the reply.
+
+        :param timeout: Seconds to wait for that reply.  Without one a peer
+            that accepts the request and never answers leaves this awaiting
+            forever; every other client transport here takes a bound, so
+            this one does too.
+        """
         await self.connect()
         await self.packer.send(self.writer, message)
 
         if expect_reply:
             try:
-                recv_data = await self.packer.recv(self.reader)
+                if timeout is None:
+                    recv_data = await self.packer.recv(self.reader)
+                else:
+                    recv_data = await asyncio.wait_for(
+                        self.packer.recv(self.reader), timeout)
             except ConnectionError:
                 recv_data = b''
             return recv_data

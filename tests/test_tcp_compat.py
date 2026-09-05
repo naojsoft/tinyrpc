@@ -105,3 +105,59 @@ def test_the_new_transport_frames_by_default(peer):
 
     assert peer.saw and peer.saw[0].startswith(b'1.0,'), \
         "expected the length prefix this transport is for"
+
+
+# ----------------------------------------------- the pairs must agree --
+
+#: Which client transport is meant to talk to which server transport, and
+#: what framing that pair speaks.  ``AsyncTcpClientTransport`` is absent on
+#: purpose: it exists to talk to peers that are not tinyrpc at all.
+PAIRS = [
+    ('ConnectionlessTcpClientTransport', 'ConnectionlessTcpServerTransport'),
+    ('TcpClientTransport', 'TcpServerTransport'),
+    ('NonBlockingTcpClientTransport', 'TcpServerTransport'),
+    ('AsyncioTcpClientTransport', 'AsyncioTcpServerTransport'),
+]
+
+
+def default_packer(name):
+    """Which packer a transport reaches for when given none."""
+    import inspect
+
+    from tinyrpc.transports import tcp as mod
+    source = inspect.getsource(getattr(mod, name).__init__)
+    for candidate in ('AsyncioTransportPackerRobust', 'AsyncioTransportPacker',
+                      'TransportPackerRobust', 'TransportPacker'):
+        if 'packer = %s(' % candidate in source:
+            return candidate
+    raise AssertionError('%s picks no default packer' % (name,))
+
+
+@pytest.mark.parametrize('client_name,server_name', PAIRS)
+def test_a_client_and_its_server_frame_the_same_way(client_name, server_name):
+    """Regression, and a guard against the next one.
+
+    TcpServerTransport was moved to length-prefixed framing and
+    TcpClientTransport was left behind, so tinyrpc's own client could not
+    talk to tinyrpc's own server.  Nothing caught it because nothing tested
+    that pair -- and a framing mismatch does not raise, it times out.
+    """
+    assert default_packer(client_name) == default_packer(server_name), (
+        "%s and %s disagree about framing, so they cannot talk to each other"
+        % (client_name, server_name))
+
+
+@pytest.mark.parametrize('client_name,_server', PAIRS)
+def test_a_client_transport_accepts_the_timeout_the_client_passes(
+        client_name, _server):
+    """RPCClient.call() hands its keyword arguments straight to the
+    transport, so one that does not take `timeout` turns
+    ``call(..., timeout=5)`` into a TypeError instead of a timeout."""
+    import inspect
+
+    from tinyrpc.transports import tcp as mod
+    params = inspect.signature(
+        getattr(mod, client_name).send_message).parameters
+    assert 'timeout' in params or any(
+        p.kind is p.VAR_KEYWORD for p in params.values()), (
+        "%s.send_message() rejects timeout=" % (client_name,))
