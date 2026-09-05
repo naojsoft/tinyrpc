@@ -142,6 +142,17 @@ multiplex -- in exchange the connection can die, so the client dials again.
     :show-inheritance:
     :member-order: bysource
 
+.. note:: The length prefix is a ``tinyrpc`` extension. Standard msgpack-RPC
+    over TCP has none -- the msgpack stream is self-delimiting -- so a peer
+    that is not ``tinyrpc`` sees the prefix as a malformed message and answers
+    nothing. Pass ``packer=TransportPacker()`` to talk to one.
+
+.. autoclass:: tinyrpc.transports.tcp.AsyncTcpClientTransport
+    :members:
+    :noindex:
+    :show-inheritance:
+    :member-order: bysource
+
 asyncio
 ~~~~~~~
 

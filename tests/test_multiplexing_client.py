@@ -435,10 +435,25 @@ def test_concurrent_callers_each_get_their_own_result(protocol_cls):
 # ---------------------------------------------------------------- naming --
 
 def test_old_names_still_resolve():
-    """The renames keep working for code that has not been updated yet."""
+    """The renames keep working for code that has not been updated yet.
+
+    Note what is *not* asserted of the transport.  This test used to require
+    the old name to be the very same class, and that identity was the bug:
+    the new class frames messages with a length prefix and the old one did
+    not, so inheriting the new default silently changed what went on the
+    wire.  What matters is that the old name keeps its own framing, which is
+    :py:mod:`tests.test_tcp_compat`'s business.
+    """
     from tinyrpc.client_multiplexing import AsyncRPCClient
     from tinyrpc.transports.tcp import (AsyncTcpClientTransport,
-                                        NonBlockingTcpClientTransport)
+                                        NonBlockingTcpClientTransport,
+                                        TransportPacker,
+                                        TransportPackerRobust)
 
     assert AsyncRPCClient is MultiplexingRPCClient
-    assert AsyncTcpClientTransport is NonBlockingTcpClientTransport
+    assert issubclass(AsyncTcpClientTransport, NonBlockingTcpClientTransport)
+
+    kept = AsyncTcpClientTransport(('127.0.0.1', 1))
+    assert isinstance(kept.packer, TransportPacker)
+    assert not isinstance(kept.packer, TransportPackerRobust), \
+        "the old name must keep the framing it always had"
