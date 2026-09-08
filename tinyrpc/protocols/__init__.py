@@ -326,6 +326,22 @@ class RPCProtocol(ABC):
 
 class RPCBatchProtocol(RPCProtocol, ABC):
     """Abstract base class for all batch protocol implementations."""
+
+    def parse_batch_reply(self, data: bytes) -> Union['RPCResponse',
+                                                      'RPCBatchResponse']:
+        """De-serializes a reply to a batch request.
+
+        Most protocols do not need this: a JSON-RPC batch reply is a JSON
+        array where a single reply is an object, so
+        :py:meth:`~RPCProtocol.parse_reply` can tell them apart by looking.
+
+        XML-RPC cannot.  A ``system.multicall`` reply is an ordinary
+        ``<methodResponse>`` carrying an array, indistinguishable from a
+        single call that returned an array, and the reply carries no id and
+        no method name to settle it.  The knowledge lives with the caller,
+        which sent the batch, so this is where the caller hands it over.
+        """
+        return self.parse_reply(data)
     def create_batch_request(
             self, requests: List['RPCRequest'] = None
     ) -> 'RPCBatchRequest':

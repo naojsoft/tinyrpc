@@ -7,7 +7,7 @@ from typing import List, Any, Dict, Callable, Optional
 
 from .transports import ClientTransport
 from .exc import RPCError
-from .protocols import (RPCErrorResponse, RPCProtocol, RPCRequest,
+from .protocols import (RPCBatchRequest, RPCErrorResponse, RPCProtocol, RPCRequest,
                         RPCResponse, RPCBatchResponse)
 
 RPCCall = namedtuple('RPCCall', 'method args kwargs')
@@ -65,8 +65,12 @@ class RPCClient(object):
                 # ... and be done
                 return
 
-            # ... or process the reply
-            response = self.protocol.parse_reply(reply)
+            # ... or process the reply.  A batch says so, because some
+            # protocols cannot tell from the reply alone.
+            if isinstance(req, RPCBatchRequest):
+                response = self.protocol.parse_batch_reply(reply)
+            else:
+                response = self.protocol.parse_reply(reply)
         except Exception:
             # The reply is not coming, or was unusable.  A protocol that
             # remembers which ids it is expecting replies for would otherwise
