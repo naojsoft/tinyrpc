@@ -22,9 +22,9 @@ msgpack = pytest.importorskip('msgpack')
 
 from tinyrpc import RPCClient                                    # noqa: E402
 from tinyrpc.protocols.msgpackrpc import MSGPACKRPCProtocol      # noqa: E402
-from tinyrpc.transports.tcp import (AsyncTcpClientTransport,     # noqa: E402
-                                    NonBlockingTcpClientTransport,
-                                    TransportPacker)
+from tinyrpc.transports.tcp import (NonBlockingTcpClientTransport,  # noqa: E402
+                                    TransportPacker,
+                                    UnframedTcpClientTransport)
 
 HOST = '127.0.0.1'
 
@@ -70,14 +70,14 @@ def peer():
     p.close()
 
 
-def test_the_old_name_still_talks_to_an_unframed_peer(peer):
-    """Regression.  AsyncTcpClientTransport became a plain alias for the
+def test_the_unframed_transport_talks_to_an_unframed_peer(peer):
+    """Regression.  This class was briefly a plain alias for the
     length-prefixed transport, so it began sending a 32-byte header that a
     standard msgpack-RPC peer cannot parse -- the call went out, nothing came
     back, and it surfaced as a timeout.  Importing still worked, which is what
     made it quiet."""
     client = RPCClient(MSGPACKRPCProtocol(),
-                       AsyncTcpClientTransport((HOST, peer.port)))
+                       UnframedTcpClientTransport((HOST, peer.port)))
     assert client.call('status', [1], {}, timeout=10.0) == ['status', [1]]
 
     assert peer.saw, "nothing reached the peer"
@@ -110,8 +110,8 @@ def test_the_new_transport_frames_by_default(peer):
 # ----------------------------------------------- the pairs must agree --
 
 #: Which client transport is meant to talk to which server transport, and
-#: what framing that pair speaks.  ``AsyncTcpClientTransport`` is absent on
-#: purpose: it exists to talk to peers that are not tinyrpc at all.
+#: what framing that pair speaks.  ``UnframedTcpClientTransport`` is absent
+#: on purpose: it exists to talk to peers that are not tinyrpc at all.
 PAIRS = [
     ('ConnectionlessTcpClientTransport', 'ConnectionlessTcpServerTransport'),
     ('TcpClientTransport', 'TcpServerTransport'),
@@ -238,7 +238,7 @@ def test_an_unframed_stateful_server_can_be_built_too():
         sock, packer=TransportPacker(), poll_timeout=0.2))
     try:
         client = RPCClient(MSGPACKRPCProtocol(),
-                           AsyncTcpClientTransport((HOST, port)))
+                           UnframedTcpClientTransport((HOST, port)))
         assert client.call('echo', ['one'], {}, timeout=5.0) == 'one'
         assert client.call('echo', ['two'], {}, timeout=5.0) == 'two'
     finally:
@@ -297,3 +297,21 @@ def test_one_place_decides_the_default():
                     or 'default_asyncio_packer()' in source), (
                 "%s names its default packer itself instead of asking"
                 % (name,))
+
+
+
+def test_the_former_name_still_resolves(peer):
+    """``AsyncTcpClientTransport`` said what the class is not -- it is
+    threaded, not asyncio -- but code imports it, so it keeps working.
+
+    A plain alias is safe here where it was not before: it names the same
+    class, so it carries the same framing.  What broke last time was
+    aliasing the name to a class that framed differently.
+    """
+    from tinyrpc.transports.tcp import AsyncTcpClientTransport
+
+    assert AsyncTcpClientTransport is UnframedTcpClientTransport
+
+    client = RPCClient(MSGPACKRPCProtocol(),
+                       AsyncTcpClientTransport((HOST, peer.port)))
+    assert client.call('status', [], {}, timeout=10.0) == ['status', []]

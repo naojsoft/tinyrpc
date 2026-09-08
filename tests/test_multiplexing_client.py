@@ -448,12 +448,15 @@ def test_old_names_still_resolve():
     from tinyrpc.transports.tcp import (AsyncTcpClientTransport,
                                         NonBlockingTcpClientTransport,
                                         TransportPacker,
-                                        TransportPackerRobust)
+                                        TransportPackerRobust,
+                                        UnframedTcpClientTransport)
 
     assert AsyncRPCClient is MultiplexingRPCClient
-    assert issubclass(AsyncTcpClientTransport, NonBlockingTcpClientTransport)
+    assert AsyncTcpClientTransport is UnframedTcpClientTransport
+    assert issubclass(UnframedTcpClientTransport,
+                      NonBlockingTcpClientTransport)
 
-    kept = AsyncTcpClientTransport(('127.0.0.1', 1))
+    kept = UnframedTcpClientTransport(('127.0.0.1', 1))
     assert isinstance(kept.packer, TransportPacker)
     assert not isinstance(kept.packer, TransportPackerRobust), \
-        "the old name must keep the framing it always had"
+        "the unframed transport must stay unframed"

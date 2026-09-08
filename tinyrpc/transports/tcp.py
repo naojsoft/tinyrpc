@@ -625,30 +625,33 @@ class NonBlockingTcpClientTransport(NonBlockingClientTransport):
                 self._sock = None
 
 
-class AsyncTcpClientTransport(NonBlockingTcpClientTransport):
-    """The former name of :py:class:`NonBlockingTcpClientTransport`.
+class UnframedTcpClientTransport(NonBlockingTcpClientTransport):
+    """A held TCP connection that sends messages with no length prefix.
 
-    The name was misleading -- this transport is threaded and has nothing to
-    do with :py:mod:`asyncio` (contrast
-    :py:class:`AsyncioTcpClientTransport`) -- but a plain alias would have
-    been a false promise, because the rename was not the only change.
+    Which is what standard msgpack-RPC over TCP does: the msgpack stream is
+    self-delimiting, so the body is the whole message and there is nothing
+    to prefix it with.  Use this to talk to a peer that is not ``tinyrpc``.
 
-    The class it now derives from frames messages with a length prefix, and
-    this one did not.  That difference is *on the wire*: standard
-    msgpack-RPC over TCP has no length prefix, relying on the msgpack stream
-    being self-delimiting, so a peer that is not ``tinyrpc`` sees the prefix
-    as a malformed message and answers nothing.  Silently changing it under
-    an existing name would have broken exactly the deployments the name
-    exists to protect.
+    Everything else -- holding one connection, dialling again when it drops,
+    the reader thread -- is :py:class:`NonBlockingTcpClientTransport`'s.
+    Only the default packer differs, and that difference is on the wire: a
+    peer expecting no prefix reads one as a malformed message and answers
+    nothing, so the call does not fail, it times out.
 
-    So this keeps the framing it always had.  New code should use
-    :py:class:`NonBlockingTcpClientTransport`, whose length prefix is what
-    makes a reply larger than one read arrive whole, and what multiplexing
-    needs to tell replies apart; pass ``packer=TransportPacker()`` there to
-    talk to a peer that does not expect it.
+    Prefer :py:class:`NonBlockingTcpClientTransport` between two ``tinyrpc``
+    ends.  Its length prefix is what makes a reply larger than one read
+    arrive whole -- without it a message that does not fit in a single
+    ``recv()`` arrives in pieces -- and what a multiplexing client needs to
+    tell replies apart.
 
-    .. deprecated::
-        Use :py:class:`NonBlockingTcpClientTransport`.
+    For a server that speaks the same unframed format, pass
+    ``packer=TransportPacker()`` to
+    :py:class:`TcpServerTransport` or
+    :py:class:`ConnectionlessTcpServerTransport`.
+
+    This was called ``AsyncTcpClientTransport``, which said what it is not:
+    it is threaded, and has nothing to do with :py:mod:`asyncio` -- for that
+    see :py:class:`AsyncioTcpClientTransport`.
     """
 
     def __init__(self, endpoint: tuple[str, int], packer: Any = None,
@@ -656,6 +659,15 @@ class AsyncTcpClientTransport(NonBlockingTcpClientTransport):
         super().__init__(endpoint,
                          packer=TransportPacker() if packer is None else packer,
                          **kwargs)
+
+
+#: The former name.  A plain alias is safe here where it was not before:
+#: it names the same class, so it carries the same framing.  What broke
+#: last time was aliasing it to a class that framed differently.
+#:
+#: .. deprecated::
+#:     Use :py:class:`UnframedTcpClientTransport`.
+AsyncTcpClientTransport = UnframedTcpClientTransport
 
 
 class TransportPacker:

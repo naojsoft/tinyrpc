@@ -169,17 +169,20 @@ returned. Messages that fit in one read are fine -- which is most RPC traffic,
 and why the unframed format works at all -- and a larger one arrives in pieces
 and fails to parse.
 
-:py:class:`~tinyrpc.transports.tcp.AsyncTcpClientTransport` is the one
-transport whose default is unframed, because that is what it always was and
-what its callers talk to.
+:py:class:`~tinyrpc.transports.tcp.UnframedTcpClientTransport` is the one
+transport whose default is unframed, for exactly that case. It is otherwise
+:py:class:`~tinyrpc.transports.tcp.NonBlockingTcpClientTransport` -- one held
+connection, re-dialled when it drops -- and was formerly called
+``AsyncTcpClientTransport``, which said what it is not: it is threaded, not
+:py:mod:`asyncio`.
 
-.. autofunction:: tinyrpc.transports.tcp.default_packer
-
-.. autoclass:: tinyrpc.transports.tcp.AsyncTcpClientTransport
+.. autoclass:: tinyrpc.transports.tcp.UnframedTcpClientTransport
     :members:
     :noindex:
     :show-inheritance:
     :member-order: bysource
+
+.. autofunction:: tinyrpc.transports.tcp.default_packer
 
 asyncio
 ~~~~~~~
