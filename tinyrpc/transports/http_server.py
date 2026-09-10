@@ -203,6 +203,13 @@ class HttpServerTransport(ServerTransport):
                                                         server_side=True)
 
         self._thread = None
+        # Set by the serve thread just before it enters the loop.  shutdown()
+        # only stops a loop that has started: called before the thread gets
+        # there it finds the "shut down" event still set from construction,
+        # returns at once, and the loop then runs on with nobody waiting for
+        # it -- so the socket gets closed underneath it.
+        self._entered = threading.Event()
+        self._closed = False
         # start() and stop() are called from more than one place -- a server
         # loop's shutdown path and its owner's -- so both must be safe to
         # call twice and at once.
@@ -214,12 +221,17 @@ class HttpServerTransport(ServerTransport):
         service when the port was chosen by the OS."""
         return self.httpd.server_address[:2]
 
+    def _serve(self) -> None:
+        self._entered.set()
+        self.httpd.serve_forever(poll_interval=0.1)
+
     def start(self) -> None:
         """Begin accepting connections, in a thread of its own."""
         with self._lifecycle:
-            if self._thread is not None:
+            if self._thread is not None or self._closed:
                 return
-            self._thread = threading.Thread(target=self.httpd.serve_forever,
+            self._entered.clear()
+            self._thread = threading.Thread(target=self._serve,
                                             name='http-transport')
             self._thread.daemon = True
             self._thread.start()
@@ -227,14 +239,24 @@ class HttpServerTransport(ServerTransport):
     def stop(self) -> None:
         """Stop accepting connections and release the listening socket.
 
-        Safe to call whether or not :py:meth:`start` was.  ``shutdown()``
-        waits for the serve loop to acknowledge, so calling it when that loop
-        was never started waits for an acknowledgement that cannot come.
+        Safe to call whether or not :py:meth:`start` was, and safe to call
+        twice or from two threads at once -- which is ordinary, since a
+        server loop stops its transport on the way out and so does whoever
+        asked the server to stop.
+
+        The waiting is not incidental.  ``shutdown()`` only stops a loop that
+        has started, and closing the socket before the loop has registered it
+        leaves that thread to fail on a file descriptor of -1, in a place
+        nothing is watching.
         """
         with self._lifecycle:
             thread, self._thread = self._thread, None
+            if self._closed:
+                return
+            self._closed = True
 
         if thread is not None:
+            self._entered.wait(timeout=5.0)
             self.httpd.shutdown()
             thread.join(timeout=5.0)
         try:
