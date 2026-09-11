@@ -265,6 +265,60 @@ def test_call_argument_validation(dispatch):
     dispatch.validate_parameters(dir, [], {})
     # should skip validation, will produce error otherwise
 
+def test_positional_only_passed_by_keyword_is_invalid(dispatch):
+    """A positional-only parameter cannot be filled by keyword.
+
+    inspect.getcallargs, which this used to use, predates PEP 570 and let
+    such a call through to fail inside the method as a bare TypeError.
+    """
+    def f(a, /, b):
+        return a + b
+
+    dispatch.validate_parameters(f, [1, 2], {})
+    with pytest.raises(InvalidParamsError):
+        dispatch.validate_parameters(f, [], {'a': 1, 'b': 2})
+
+
+def test_validation_reflects_each_method_not_the_first_seen(dispatch):
+    """Signatures are cached, so they must be cached per method."""
+    def one(a):
+        return a
+
+    def two(a, b):
+        return a + b
+
+    dispatch.validate_parameters(one, [1], {})
+    dispatch.validate_parameters(two, [1, 2], {})
+    with pytest.raises(InvalidParamsError):
+        dispatch.validate_parameters(one, [1, 2], {})
+    with pytest.raises(InvalidParamsError):
+        dispatch.validate_parameters(two, [1], {})
+
+
+def test_signatures_are_derived_once_per_method(dispatch):
+    """The point of the cache: deriving a signature is what validation cost."""
+    import inspect as _inspect
+    from tinyrpc import dispatch as _dispatch_mod
+
+    def f(a, b):
+        return a + b
+
+    calls = []
+    real = _inspect.signature
+
+    def counting(obj, *a, **kw):
+        calls.append(obj)
+        return real(obj, *a, **kw)
+
+    _dispatch_mod._signature_of.cache_clear()
+    _inspect.signature = counting
+    try:
+        for _ in range(5):
+            dispatch.validate_parameters(f, [1, 2], {})
+    finally:
+        _inspect.signature = real
+    assert calls.count(f) == 1
+
 def test_bound_method_argument_error(dispatch, invoke_with):
     method, args, kwargs, result = invoke_with
 
