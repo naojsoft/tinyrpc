@@ -496,13 +496,37 @@ class Encrypt(Layer):
             raise FramingError('could not decrypt: %s' % (e,)) from None
 
 
+#: PBKDF2 rounds used by :py:func:`derive_key` when the caller names none.
+#:
+#: What the rounds buy is narrow: they make *offline* guessing of the
+#: passphrase expensive for somebody who has captured traffic and wants the
+#: key behind it.  They do nothing against anything else -- not forgery, not
+#: replay, not a caller who already knows the passphrase -- so the number
+#: worth paying depends on how secret the passphrase really is and what an
+#: attacker would gain by recovering it.
+#:
+#: Two hundred thousand is around 30ms here, which is the right order for a
+#: passphrase that is genuinely secret and long-lived.  It is paid once per
+#: key, so a service that runs for weeks never notices; a program invoked
+#: over and over pays it every time it starts.
+DEFAULT_KDF_ROUNDS = 200000
+
+
 def derive_key(passphrase: str, salt: bytes = b'tinyrpc-flexrpc',
-               length: int = 32) -> bytes:
+               length: int = 32, rounds: int = None) -> bytes:
     """Turn a passphrase into a key of the right length.
 
     Uses PBKDF2, so a weak passphrase is at least expensive to attack.  A key
     generated with :py:func:`os.urandom` is better where one can be
     distributed; this is for where a passphrase is what there is.
+
+    :param rounds: How hard to make guessing the passphrase, in PBKDF2
+        iterations.  Defaults to :py:data:`DEFAULT_KDF_ROUNDS`.  Both ends
+        must use the same number: it is part of what decides the key, not a
+        policy each end can choose, and a mismatch does not fail at setup --
+        it produces two different keys and every signature is refused.
     """
+    if rounds is None:
+        rounds = DEFAULT_KDF_ROUNDS
     return hashlib.pbkdf2_hmac('sha256', passphrase.encode('utf-8'),
-                               salt, 200000, dklen=length)
+                               salt, rounds, dklen=length)

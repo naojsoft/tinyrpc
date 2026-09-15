@@ -132,6 +132,46 @@ def test_derive_key_gives_a_usable_key():
     assert derive_key('another') != key
 
 
+def test_derive_key_rounds_can_be_named():
+    """What the rounds buy is resistance to guessing the passphrase offline,
+    which is worth different amounts to different callers -- so the cost is
+    theirs to choose rather than fixed here."""
+    cheap = derive_key('a passphrase', rounds=1000)
+
+    assert len(cheap) == 32
+    assert derive_key('a passphrase', rounds=1000) == cheap
+    assert derive_key('a passphrase', rounds=2000) != cheap, \
+        "the rounds decide the key, so both ends must agree on them"
+
+
+def test_derive_key_defaults_to_the_module_setting():
+    from tinyrpc import layers
+
+    assert derive_key('a passphrase') == derive_key(
+        'a passphrase', rounds=layers.DEFAULT_KDF_ROUNDS)
+
+
+def test_a_key_derived_cheaply_still_signs():
+    """Cheaper to derive is not weaker to forge: the rounds only make the
+    passphrase behind the key expensive to guess, and the signature is the
+    same HMAC either way."""
+    key = derive_key('a passphrase', rounds=1000)
+    f = Framing(layers=[Signature({'status': key}, sign_as='status')],
+                require=FLAG_SIGNED)
+
+    got = f.unwrap(f.wrap(b'hello'))
+    assert got.payload == b'hello'
+    assert got.flags & FLAG_SIGNED
+    assert got.principal == 'status', "and it still names who signed"
+
+    other_key = derive_key('a passphrase', rounds=2000)
+    other = Framing(layers=[Signature({'status': other_key},
+                                      sign_as='status')],
+                    require=FLAG_SIGNED)
+    with pytest.raises(FramingError):
+        other.unwrap(f.wrap(b'hello'))
+
+
 # ------------------------------------------------------- layers together --
 
 def test_compress_then_encrypt_then_sign():
