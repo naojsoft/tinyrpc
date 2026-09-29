@@ -315,3 +315,144 @@ def test_the_former_name_still_resolves(peer):
     client = RPCClient(MSGPACKRPCProtocol(),
                        AsyncTcpClientTransport((HOST, peer.port)))
     assert client.call('status', [], {}, timeout=10.0) == ['status', []]
+
+
+# ------------------------------------ reading the unframed stream properly --
+#
+# TransportPackerMsgpack puts the same bytes on the wire as TransportPacker --
+# none of its own -- and differs only in reading them: msgpack is
+# self-delimiting, so a message that spans reads can be assembled and two
+# that arrived together can be told apart.
+
+def test_the_msgpack_packer_puts_nothing_of_its_own_on_the_wire():
+    """Which is what makes it interoperable: the wire format is the standard
+    one, and only the reading side is cleverer."""
+    from tinyrpc.transports.tcp import TransportPackerMsgpack
+
+    msgs = [msgpack.packb([0, 1, 'echo', ['hi']]),
+            msgpack.packb([1, 1, None, 'hi'])]
+    raw = TransportPacker()
+    smart = TransportPackerMsgpack()
+
+    assert ([raw.pack(m) for m in msgs] == [smart.pack(m) for m in msgs]
+            == msgs)
+
+
+def test_the_msgpack_packer_reassembles_a_big_reply_from_a_plain_peer():
+    """The ceiling test_unframed_stops_working_at_one_read pins, lifted, and
+    against a peer that is not tinyrpc.
+
+    The reply direction is the one a client packer is responsible for, and
+    the one that cannot be avoided by asking for less: a status call is small
+    and its answer need not be.  (UnframedPeer above reads with a single
+    recv(), so it is the wrong end to send a large *request* to -- that is
+    the same limitation, on the server side, and
+    test_a_server_can_read_the_unframed_stream_properly_too covers it.)
+    """
+    from tinyrpc.transports.tcp import (TransportPackerMsgpack,
+                                        UnframedTcpClientTransport)
+
+    big = 'x' * 200000
+    listener = socket.socket()
+    listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    listener.bind((HOST, 0))
+    listener.listen(4)
+    port = listener.getsockname()[1]
+
+    def serve():
+        conn, _ = listener.accept()
+        with conn:
+            request = conn.recv(65536)
+            _type, msgid, _method, _params = msgpack.unpackb(request,
+                                                             raw=False)
+            conn.sendall(msgpack.packb([1, msgid, None, big],
+                                       use_bin_type=True))
+
+    thread = threading.Thread(target=serve, daemon=True)
+    thread.start()
+    try:
+        client = RPCClient(MSGPACKRPCProtocol(),
+                           UnframedTcpClientTransport(
+                               (HOST, port),
+                               packer=TransportPackerMsgpack()))
+        assert client.call('status', [], {}, timeout=15.0) == big
+    finally:
+        listener.close()
+
+
+def test_a_message_split_across_reads_is_reassembled():
+    from tinyrpc.transports.tcp import TransportPackerMsgpack
+
+    left, right = socket.socketpair()
+    try:
+        message = msgpack.packb([0, 1, 'echo', ['y' * 300000]])
+        threading.Thread(target=lambda: left.sendall(message),
+                         daemon=True).start()
+        assert TransportPackerMsgpack().recv(right) == message
+    finally:
+        left.close()
+        right.close()
+
+
+def test_two_messages_that_arrived_together_are_told_apart():
+    """Raw framing hands both up as one lump, and the protocol sees a
+    trailing object it did not ask for."""
+    from tinyrpc.transports.tcp import TransportPackerMsgpack
+
+    left, right = socket.socketpair()
+    try:
+        first = msgpack.packb([0, 1, 'echo', ['one']])
+        second = msgpack.packb([0, 2, 'echo', ['two']])
+        left.sendall(first + second)
+        packer = TransportPackerMsgpack()
+
+        assert packer.recv(right) == first
+        assert packer.recv(right) == second
+    finally:
+        left.close()
+        right.close()
+
+
+def test_one_packer_keeps_each_connection_s_bytes_apart():
+    """A server hands every connection it accepts to the same packer, so
+    half a message on one must not be mistaken for part of another."""
+    from tinyrpc.transports.tcp import TransportPackerMsgpack
+
+    a_left, a_right = socket.socketpair()
+    b_left, b_right = socket.socketpair()
+    try:
+        a_msg = msgpack.packb([0, 1, 'echo', ['a' * 100000]])
+        b_msg = msgpack.packb([0, 2, 'echo', ['b' * 100000]])
+        packer = TransportPackerMsgpack()
+
+        a_left.sendall(a_msg[:40000])          # half of one
+        b_left.sendall(b_msg)                  # all of the other
+        assert packer.recv(b_right) == b_msg
+
+        threading.Thread(target=lambda: a_left.sendall(a_msg[40000:]),
+                         daemon=True).start()
+        assert packer.recv(a_right) == a_msg
+    finally:
+        for sock in (a_left, a_right, b_left, b_right):
+            sock.close()
+
+
+def test_a_server_can_read_the_unframed_stream_properly_too():
+    from tinyrpc.transports.tcp import (TcpClientTransport, TcpServerTransport,
+                                        TransportPackerMsgpack)
+
+    sock, port = listening()
+    server, executor = echo_server(TcpServerTransport(
+        sock, packer=TransportPackerMsgpack(), poll_timeout=0.2))
+    try:
+        client = RPCClient(MSGPACKRPCProtocol(),
+                           TcpClientTransport(
+                               (HOST, port),
+                               packer=TransportPackerMsgpack()))
+        # the size that defeats the raw packer, both ways
+        big = 'x' * 100000
+        assert client.call('echo', [big], {}, timeout=15.0) == big
+        assert client.call('echo', ['small'], {}, timeout=5.0) == 'small'
+    finally:
+        server.stop()
+        executor.shutdown(wait=False)

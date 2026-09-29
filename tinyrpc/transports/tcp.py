@@ -5,6 +5,7 @@ from typing import Tuple, Any, Optional
 from types import SimpleNamespace
 import socket
 import threading
+import weakref
 import queue
 import time
 import asyncio
@@ -764,6 +765,174 @@ class TransportPackerRobust(TransportPacker):
 
         return msg
 
+
+
+class _MsgpackStream:
+    """One connection's worth of half-read msgpack.
+
+    The Unpacker is only used to find where each message ends: `tell()`
+    reports how far into the stream it has consumed, so the bytes handed
+    back are the ones that arrived, not a re-encoding of the object.  That
+    keeps this a framing concern and leaves decoding to the protocol, which
+    is the layer that knows what it asked for.
+    """
+
+    #: How many already-returned bytes to keep before trimming the buffer.
+    #: Trimming is O(n) in what remains, so it is worth doing in batches.
+    trim_at = 1 << 16
+
+    def __init__(self, unpacker: Any) -> None:
+        self.unpacker = unpacker
+        self.buf = bytearray()
+        # Stream offsets: `base` is the offset of buf[0], `consumed` is how
+        # far messages have been handed out, `fed` how much has gone into the
+        # Unpacker.  The Unpacker counts from the start of the stream and
+        # knows nothing of the trimming, so all of these are kept in the same
+        # units and differenced.
+        self.base = 0
+        self.consumed = 0
+        self.fed = 0
+
+    @property
+    def drained(self) -> bool:
+        """Whether every byte read so far has been handed out."""
+        return self.consumed == self.fed
+
+    def feed_whole(self, data: bytes) -> Optional[bytes]:
+        """Feed a read that may be a message all by itself.
+
+        The common case by far -- a small call arriving in one piece -- and
+        worth not copying: when the buffer was drained and this read holds
+        exactly one message, the read *is* the message and can be handed
+        straight back.  Anything else falls through to the buffer.
+        """
+        self.unpacker.feed(data)
+        self.fed += len(data)
+        try:
+            self.unpacker.unpack()
+        except Exception as e:
+            if type(e).__name__ != 'OutOfData':
+                raise
+            # Incomplete: the bytes have to be kept after all.
+            self.buf += data
+            return None
+
+        if self.unpacker.tell() == self.fed:
+            # Exactly one message, nothing left over.  buf stays empty, so
+            # base moves with consumed to keep the offsets in step.
+            self.consumed = self.fed
+            self.base = self.fed
+            return data
+
+        # More than one message in this read: keep them and let
+        # next_message() cut them up, rewinding what was just consumed.
+        self.buf += data
+        end = self.unpacker.tell()
+        message = bytes(self.buf[self.consumed - self.base:end - self.base])
+        self.consumed = end
+        return message
+
+    def feed(self, data: bytes) -> None:
+        self.buf += data
+        self.unpacker.feed(data)
+        self.fed += len(data)
+
+    def next_message(self) -> Optional[bytes]:
+        """The next complete message, or None if more bytes are needed."""
+        try:
+            self.unpacker.unpack()
+        except Exception as e:
+            # OutOfData is the ordinary "not yet"; anything else is a stream
+            # this packer cannot make sense of, and is the caller's to report.
+            if type(e).__name__ != 'OutOfData':
+                raise
+            return None
+
+        end = self.unpacker.tell()
+        start = self.consumed
+        message = bytes(self.buf[start - self.base:end - self.base])
+        self.consumed = end
+
+        if start - self.base > self.trim_at:
+            del self.buf[:start - self.base]
+            self.base = start
+        return message
+
+
+class TransportPackerMsgpack(TransportPacker):
+    """Framing for standard msgpack-RPC: none on the wire.
+
+    msgpack is self-delimiting, so a msgpack-RPC peer sends objects back to
+    back with no length prefix.  :py:class:`TransportPacker` puts nothing on
+    the wire either, which is why it interoperates -- but it hands the
+    protocol whatever one ``recv()`` returned, so a message larger than a
+    read arrives in pieces and two small ones that arrived together arrive
+    as one.
+
+    This reads the stream properly instead: bytes go into an Unpacker until
+    a whole message is there, and what is left over stays for the next call.
+    The bytes on the wire are identical to :py:class:`TransportPacker`'s --
+    this is the same wire format, read correctly -- so it is the packer to
+    give a peer that is not ``tinyrpc``.
+
+    It is stateful per connection, and one packer instance serves every
+    connection a server accepts, so the state is keyed by socket and held
+    weakly: when a connection is closed and collected, its half-read bytes
+    go with it.
+    """
+
+    def __init__(self, chunk_size: int = 65536) -> None:
+        super().__init__()
+        try:
+            import msgpack
+        except ImportError:
+            raise ImportError(
+                "TransportPackerMsgpack needs the 'msgpack' package, which "
+                "is what makes a length prefix unnecessary")
+        self._msgpack = msgpack
+        self.chunk_size = chunk_size
+        self._streams: Any = weakref.WeakKeyDictionary()
+        self._lock = threading.Lock()
+
+    def pack(self, msg: bytes) -> bytes:
+        return msg
+
+    def send(self, sock: socket.socket, msg: bytes) -> None:
+        try:
+            sock.sendall(msg)
+        except socket.error as e:
+            raise ConnectionError(f"socket send error: {e}")
+
+    def _stream(self, sock: socket.socket) -> _MsgpackStream:
+        with self._lock:
+            stream = self._streams.get(sock)
+            if stream is None:
+                stream = _MsgpackStream(
+                    self._msgpack.Unpacker(raw=False, strict_map_key=False))
+                self._streams[sock] = stream
+            return stream
+
+    def recv(self, sock: socket.socket) -> bytes:
+        stream = self._stream(sock)
+        while True:
+            message = stream.next_message()
+            if message is not None:
+                return message
+
+            drained = stream.drained
+            try:
+                data = sock.recv(self.chunk_size)
+            except socket.error as e:
+                raise ConnectionError(f"socket recv error: {e}")
+            if not data:
+                raise ConnectionError("no bytes received")
+
+            if drained:
+                message = stream.feed_whole(data)
+                if message is not None:
+                    return message
+            else:
+                stream.feed(data)
 
 
 def default_packer() -> TransportPacker:
