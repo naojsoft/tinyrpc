@@ -519,6 +519,26 @@ class NonBlockingTcpClientTransport(NonBlockingClientTransport):
             self._log('connected to %s' % (self.endpoint,))
             return sock
 
+    @staticmethod
+    def _hang_up(sock: socket.socket) -> None:
+        """Close a connection whose reader may be blocked on it.
+
+        close() alone is not enough: it releases the descriptor but does not
+        interrupt a recv() already in progress on another thread, so the
+        reader stays in the syscall and the thread is never reclaimed -- one
+        leaked per drop, for the life of the process.  shutdown() is what
+        wakes it, and it has to come first, because after close() there is no
+        descriptor left to shut down.
+        """
+        try:
+            sock.shutdown(socket.SHUT_RDWR)
+        except OSError:
+            pass                # already dead at the far end, or never up
+        try:
+            sock.close()
+        except Exception:
+            pass
+
     def _drop(self, generation: int, why: Any) -> None:
         """Forget the current connection, if it is still the one named.
 
@@ -530,10 +550,7 @@ class NonBlockingTcpClientTransport(NonBlockingClientTransport):
             if self._generation != generation or self._sock is None:
                 return
             self._log('lost the connection to %s: %s' % (self.endpoint, why))
-            try:
-                self._sock.close()
-            except Exception:
-                pass
+            self._hang_up(self._sock)
             self._sock = None
 
     def _read_forever(self, sock: socket.socket, generation: int) -> None:
@@ -619,10 +636,7 @@ class NonBlockingTcpClientTransport(NonBlockingClientTransport):
         with self._lock:
             self._closed = True
             if self._sock is not None:
-                try:
-                    self._sock.close()
-                except Exception:
-                    pass
+                self._hang_up(self._sock)
                 self._sock = None
 
 
