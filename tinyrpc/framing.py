@@ -241,7 +241,11 @@ class Layer:
             particular one rather than this end's default.  Layers that do
             not sign ignore it.
         :return: ``(payload, section)`` where ``section`` is the bytes to
-            carry in this layer's header section, or ``None``.
+            carry in this layer's header section, or ``None``.  Or ``None``
+            instead of the pair, to decline this message: nothing is
+            transformed and :py:attr:`flag` is left clear, so the far end
+            knows there is nothing to undo.  A compressing layer declines a
+            payload too short or too random to gain anything.
         """
         raise NotImplementedError
 
@@ -311,7 +315,10 @@ class Framing:
             hold, which spares both ends having to agree in advance on which
             of several the reply would carry.
         """
-        flags = self._flags
+        # Accumulated per message rather than taken from self._flags: a
+        # layer may decline one, and then the flag must be clear or the far
+        # end will try to undo what was never done.
+        flags = 0
         sections: Dict[str, bytes] = {}
 
         if credentials is not None:
@@ -320,7 +327,11 @@ class Framing:
 
         if not self._plain:
             for layer in self.layers:
-                payload, section = layer.apply(payload, sign_as)
+                applied = layer.apply(payload, sign_as)
+                if applied is None:
+                    continue
+                payload, section = applied
+                flags |= layer.flag
                 if section is not None:
                     sections[layer.section] = section
 

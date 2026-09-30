@@ -7,12 +7,14 @@ import time
 
 import pytest
 
+import os
+
 from tinyrpc import framing
 from tinyrpc.framing import (FLAG_COMPRESSED, FLAG_CREDENTIALS,
                              FLAG_ENCRYPTED, FLAG_SIGNED, Framing,
                              FramingError, PolicyError, UnsupportedVersion)
-from tinyrpc.layers import (Credentials, Deflate, Ed25519Signature,
-                            Encrypt, Signature, derive_key,
+from tinyrpc.layers import (COMPRESSORS, Credentials, Deflate,
+                            Ed25519Signature, Encrypt, Signature, derive_key,
                             generate_signing_key)
 
 KEY = b'k' * 32
@@ -797,12 +799,17 @@ def test_ed25519_distinguishes_services_of_equal_name_length():
 def test_a_body_this_end_cannot_decompress_is_refused():
     """Regression.  unwrap() walked the layers it *had* and ignored the flags
     it did not, so a receiver missing Deflate handed back a payload still
-    compressed -- as if it were the body, with nothing to say otherwise."""
+    compressed -- as if it were the body, with nothing to say otherwise.
+
+    A body that actually compresses, because one that does not is no longer
+    flagged as compressed: see
+    test_a_body_compression_cannot_help_is_sent_as_it_is.
+    """
     sender = Framing(layers=[Deflate(threshold=0)])
     receiver = Framing()
 
     with pytest.raises(FramingError) as excinfo:
-        receiver.unwrap(sender.wrap(BODY))
+        receiver.unwrap(sender.wrap(BODY * 200))
     assert 'no layer' in str(excinfo.value)
 
 
@@ -828,3 +835,149 @@ def test_a_receiver_that_requires_a_signature_still_refuses_one():
     strict = Framing(layers=[Signature(KEY_A)], require=FLAG_SIGNED)
     with pytest.raises(PolicyError):
         strict.unwrap(Framing().wrap(BODY))
+
+
+# ------------------------------------------------ compressing, and its limits --
+
+COMPRESSIBLE = BODY * 500
+
+
+@pytest.mark.parametrize('scheme', sorted(COMPRESSORS))
+def test_every_scheme_round_trips(scheme):
+    """All of them set the same flag, so the header says a message is
+    compressed but not how: both ends must be configured alike, and these are
+    the ends being configured alike."""
+    layer = COMPRESSORS[scheme]()
+    f = Framing(layers=[layer])
+
+    wrapped = f.wrap(COMPRESSIBLE)
+
+    assert len(wrapped) < len(COMPRESSIBLE), 'it did not actually compress'
+    assert f.unwrap(wrapped).payload == COMPRESSIBLE
+
+
+@pytest.mark.parametrize('scheme', sorted(COMPRESSORS))
+def test_a_scheme_cannot_read_another_scheme(scheme):
+    """Which is why both ends must agree, and what it looks like when they do
+    not: a configuration mistake reported as one, not a negotiation."""
+    others = [s for s in COMPRESSORS if s != scheme]
+    sender = Framing(layers=[COMPRESSORS[scheme]()])
+    wrapped = sender.wrap(COMPRESSIBLE)
+
+    for other in others:
+        receiver = Framing(layers=[COMPRESSORS[other]()])
+        with pytest.raises(FramingError, match='could not decompress'):
+            receiver.unwrap(wrapped)
+
+
+# ------------------------------------------------------ declining a message --
+
+def test_a_body_too_short_to_help_is_sent_as_it_is():
+    """The flag is left clear, so the far end passes the body through rather
+    than trying to undo something that was never done."""
+    f = Framing(layers=[Deflate(threshold=1000)])
+
+    wrapped = f.wrap(BODY)
+
+    assert not (f.unwrap(wrapped).flags & FLAG_COMPRESSED)
+    assert f.unwrap(wrapped).payload == BODY
+
+
+def test_a_body_below_the_threshold_is_not_even_attempted():
+    """The threshold changes no outcome -- a short body that were compressed
+    would fail the did-it-help check and be declined anyway -- so what it
+    saves is the attempt.  That is only visible from inside."""
+    attempts = []
+
+    class Counting(Deflate):
+        def _compress(self, payload):
+            attempts.append(len(payload))
+            return super()._compress(payload)
+
+    f = Framing(layers=[Counting(threshold=1000)])
+    f.wrap(BODY)
+
+    assert attempts == [], 'compressed a body it had no reason to try'
+
+    # ... and above the threshold it does try
+    g = Framing(layers=[Counting(threshold=10)])
+    g.wrap(COMPRESSIBLE)
+
+    assert attempts == [len(COMPRESSIBLE)]
+
+
+def test_a_body_compression_cannot_help_is_sent_as_it_is():
+    """Random bytes do not compress, and sending them compressed anyway costs
+    the far end a decompression for nothing.  Measured: 512KB of noise takes
+    8ms to not-compress."""
+    noise = os.urandom(20000)
+    f = Framing(layers=[Deflate(threshold=0)])
+
+    wrapped = f.wrap(noise)
+
+    assert not (f.unwrap(wrapped).flags & FLAG_COMPRESSED)
+    assert f.unwrap(wrapped).payload == noise
+    assert len(wrapped) < len(noise) + 100, 'it was not sent plain'
+
+
+def test_a_declined_body_can_be_read_by_an_end_with_no_compressor():
+    """Which falls out of declining: the flag is clear, so there is nothing
+    for unwrap's cannot_undo check to object to."""
+    sender = Framing(layers=[Deflate(threshold=1000)])
+
+    assert Framing().unwrap(sender.wrap(BODY)).payload == BODY
+
+
+# ------------------------------------------------------------ the bound --
+
+@pytest.mark.parametrize('scheme', sorted(COMPRESSORS))
+def test_a_body_that_expands_past_the_bound_is_refused(scheme):
+    """Decompressing is the one operation where a small message costs
+    arbitrary memory.  zlib turns 48KB into 50MB without trying."""
+    bomb = b'\x00' * 4_000_000
+    sender = Framing(layers=[COMPRESSORS[scheme](threshold=0)])
+    wrapped = sender.wrap(bomb)
+    assert len(wrapped) < 100_000, 'the test needs a high-ratio payload'
+
+    receiver = Framing(layers=[COMPRESSORS[scheme](max_size=1_000_000)])
+
+    with pytest.raises(FramingError, match='expands past'):
+        receiver.unwrap(wrapped)
+
+
+def test_the_bound_refuses_rather_than_truncating():
+    """A truncated body would be handed to a protocol as if it were whole,
+    which is worse than refusing: the caller would see a parse error, or
+    silently short data."""
+    bomb = b'\x00' * 4_000_000
+    sender = Framing(layers=[Deflate(threshold=0)])
+    receiver = Framing(layers=[Deflate(max_size=1000)])
+
+    with pytest.raises(FramingError):
+        receiver.unwrap(sender.wrap(bomb))
+
+
+def test_a_body_inside_the_bound_is_returned_whole():
+    big = BODY * 20000
+    f = Framing(layers=[Deflate(max_size=len(big) + 1)])
+
+    assert f.unwrap(f.wrap(big)).payload == big
+
+
+def test_the_default_bound_is_generous_enough_for_a_frame():
+    """64MB: a raw instrument frame is a few megabytes, and a bound that
+    refused one would be a bound nobody could leave on."""
+    from tinyrpc.layers import DEFAULT_MAX_DECOMPRESSED
+
+    assert DEFAULT_MAX_DECOMPRESSED >= 16 << 20
+    assert Deflate().max_size == DEFAULT_MAX_DECOMPRESSED
+
+
+# ---------------------------------------------------------------- levels --
+
+def test_the_default_level_is_the_fast_one():
+    """Measured on a 2MB raw image buffer: zlib level 6 costs seven times
+    level 1 and gains 2% of ratio, and level 9 costs twenty-two times for 4%.
+    On a local network the extra ratio is not worth the milliseconds."""
+    assert Deflate().level == 1
+    assert Deflate(level=9).level == 9

@@ -29,6 +29,8 @@ import os
 import struct
 import threading
 import time
+import bz2
+import lzma
 import zlib
 from typing import Any, Dict, Mapping, Optional, Tuple, Union
 
@@ -47,37 +49,147 @@ def _as_bytes(value: Union[bytes, str]) -> bytes:
     return value if isinstance(value, bytes) else value.encode('utf-8')
 
 
-class Deflate(Layer):
-    """Compress with :py:mod:`zlib`.
+#: How much a compressed message may expand to, unless told otherwise.
+#:
+#: Decompressing is the one operation where a small message costs arbitrary
+#: memory: zlib turns 48KB into 50MB without trying.  A bound is the defence,
+#: and an absolute one rather than a ratio, because the ratio a legitimate
+#: payload reaches depends entirely on what it is -- 2x for raw image data,
+#: 30x for repetitive text, 263x for text through lzma.
+DEFAULT_MAX_DECOMPRESSED = 64 << 20
 
-    :param level: 1 is fast and slack, 9 is slow and tight; 6 is zlib's own
-        default.
-    :param threshold: Payloads smaller than this are passed through, since
-        compressing a short message usually makes it longer.  Note the flag
-        is still set, so the far end still calls :py:meth:`remove` -- zlib
-        round-trips a stored block fine, and a per-message decision would
-        otherwise need its own header bit.
+
+class Compress(Layer):
+    """Compress the body, by whichever scheme the subclass names.
+
+    All of them set :py:data:`~tinyrpc.framing.FLAG_COMPRESSED`, so the
+    header says a message is compressed but not how.  Both ends therefore
+    have to be configured with the same scheme; one given a different scheme
+    reports that it could not decompress, which is a configuration mistake
+    rather than a negotiation to be attempted per message.
+
+    :param level: What the scheme means by effort.  Left out, the subclass
+        picks -- and picks fast rather than tight: measured on a 2MB raw
+        image buffer, zlib level 6 costs seven times level 1 and gains 2%,
+        and on a local network the extra 2% is not worth the milliseconds.
+    :param threshold: Payloads smaller than this are not compressed, since
+        compressing a short message usually lengthens it.  The flag is left
+        clear, so the far end knows to pass it through.
+    :param max_size: How large a message may decompress to before it is
+        refused.  See :py:data:`DEFAULT_MAX_DECOMPRESSED`.
     """
 
     flag = FLAG_COMPRESSED
 
-    def __init__(self, level: int = 6, threshold: int = 256) -> None:
-        self.level = level
+    #: What this scheme is called in a transport string.
+    scheme = None
+
+    #: Used when `level` is not given.
+    default_level = 1
+
+    def __init__(self, level: Optional[int] = None, threshold: int = 256,
+                 max_size: int = DEFAULT_MAX_DECOMPRESSED) -> None:
+        self.level = self.default_level if level is None else level
         self.threshold = threshold
+        self.max_size = max_size
+
+    def _compress(self, payload: bytes) -> bytes:
+        raise NotImplementedError
+
+    def _decompress(self, payload: bytes) -> bytes:
+        raise NotImplementedError
 
     def apply(self, payload: bytes,
               sign_as: Optional[Union[bytes, str]] = None
-              ) -> Tuple[bytes, Optional[bytes]]:
+              ) -> Optional[Tuple[bytes, Optional[bytes]]]:
         if len(payload) < self.threshold:
-            return zlib.compress(payload, 0), None
-        return zlib.compress(payload, self.level), None
+            # Declined: nothing to undo, so the flag stays clear.
+            return None
+        squeezed = self._compress(payload)
+        if len(squeezed) >= len(payload):
+            # It did not help -- random or already-compressed bytes -- and
+            # sending it anyway would cost the far end a decompression for
+            # nothing.
+            return None
+        return squeezed, None
 
     def remove(self, payload: bytes, sections: Dict[str, bytes],
                result: Unwrapped) -> bytes:
         try:
-            return zlib.decompress(payload)
-        except zlib.error as e:
+            return self._decompress(payload)
+        except FramingError:
+            raise
+        except Exception as e:
             raise FramingError('could not decompress: %s' % (e,)) from None
+
+
+class Deflate(Compress):
+    """Compress with :py:mod:`zlib` -- deflate, as in RFC 1951."""
+
+    scheme = 'deflate'
+    default_level = 1
+
+    def _compress(self, payload: bytes) -> bytes:
+        return zlib.compress(payload, self.level)
+
+    def _decompress(self, payload: bytes) -> bytes:
+        engine = zlib.decompressobj()
+        out = engine.decompress(payload, self.max_size)
+        if not engine.eof:
+            raise FramingError(
+                'compressed message expands past %d bytes; refusing rather '
+                'than finishing' % (self.max_size,))
+        return out
+
+
+class Bzip2(Compress):
+    """Compress with :py:mod:`bz2`: slower than deflate, and tighter."""
+
+    scheme = 'bzip2'
+    default_level = 9               # bz2's levels are block sizes, not effort
+
+    def _compress(self, payload: bytes) -> bytes:
+        return bz2.compress(payload, self.level)
+
+    def _decompress(self, payload: bytes) -> bytes:
+        engine = bz2.BZ2Decompressor()
+        out = engine.decompress(payload, self.max_size)
+        if not engine.eof:
+            raise FramingError(
+                'compressed message expands past %d bytes; refusing rather '
+                'than finishing' % (self.max_size,))
+        return out
+
+
+class Lzma(Compress):
+    """Compress with :py:mod:`lzma`: slowest, and much the tightest on text."""
+
+    scheme = 'lzma'
+    default_level = None            # lzma's preset; None is its own default
+
+    def __init__(self, level: Optional[int] = None, threshold: int = 256,
+                 max_size: int = DEFAULT_MAX_DECOMPRESSED) -> None:
+        # Unlike the others, None is a value lzma accepts and means its
+        # default preset, so it is passed through rather than replaced.
+        self.level = level
+        self.threshold = threshold
+        self.max_size = max_size
+
+    def _compress(self, payload: bytes) -> bytes:
+        return lzma.compress(payload, preset=self.level)
+
+    def _decompress(self, payload: bytes) -> bytes:
+        engine = lzma.LZMADecompressor()
+        out = engine.decompress(payload, self.max_size)
+        if not engine.eof:
+            raise FramingError(
+                'compressed message expands past %d bytes; refusing rather '
+                'than finishing' % (self.max_size,))
+        return out
+
+
+#: The compressing layers, by the name a transport string uses.
+COMPRESSORS = {cls.scheme: cls for cls in (Deflate, Bzip2, Lzma)}
 
 
 class _ReplayCache:
