@@ -106,7 +106,7 @@ def bad_msg(request):
 
 def test_transport_rejects_bad_values(transport, bad_msg):
     client, server = transport
-   
+
     with pytest.raises(TypeError):
         client.send_message(bad_msg)
 

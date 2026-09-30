@@ -4,7 +4,6 @@
 import pytest
 from unittest.mock import Mock
 
-from tinyrpc.exc import RPCError
 from tinyrpc.client import RPCClient, RPCProxy
 from tinyrpc.protocols import RPCProtocol, RPCResponse, RPCErrorResponse, RPCRequest
 from tinyrpc.transports import ClientTransport

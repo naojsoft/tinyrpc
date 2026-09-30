@@ -1,0 +1,29 @@
+name: Lint
+
+on:
+  push:
+    branches:
+    - master
+    - flexrpc
+  pull_request:
+
+# Cancel duplicate builds
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  ruff:
+    name: Lint with ruff
+    runs-on: ubuntu-latest
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v7
+    - name: Set up Python
+      uses: actions/setup-python@v6
+      with:
+        python-version: '3.x'
+    - name: Install ruff
+      run: python -m pip install --upgrade pip ruff
+    - name: Run ruff
+      run: ruff check .

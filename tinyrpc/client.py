@@ -209,7 +209,9 @@ class RPCProxy(object):
         """Returns a proxy function that, when called, will call a function
         name ``name`` on the client associated with the proxy.
         """
-        proxy_func = lambda *args, **kwargs: self.client.call(
-            self.prefix + name, args, kwargs, one_way=self.one_way
-        )
+        def proxy_func(*args, **kwargs):
+            return self.client.call(
+                self.prefix + name, args, kwargs, one_way=self.one_way
+            )
+
         return proxy_func

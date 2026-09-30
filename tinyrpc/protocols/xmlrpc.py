@@ -5,8 +5,6 @@
 """
 
 import xmlrpc.client
-import sys
-from tinyrpc.exc import UnexpectedIDError
 from typing import Dict, Any, Union, Optional, List, Tuple, Callable, Generator
 
 from . import default_id_generator
@@ -821,7 +819,7 @@ class XMLRPCProtocol(RPCBatchProtocol):
         try:
             req = xmlrpc.client.loads(data, use_builtin_types=self.use_builtin_types)
 
-        except Exception as e:
+        except Exception:
             raise XMLRPCParseError()
 
         if not isinstance(req, tuple) or len(req) != 2:
@@ -867,7 +865,7 @@ class XMLRPCProtocol(RPCBatchProtocol):
                 requests.append(req)
             except RPCError as e:
                 requests.append(e)
-            except Exception as e:
+            except Exception:
                 requests.append(XMLRPCInvalidRequestError())
 
         if not requests:

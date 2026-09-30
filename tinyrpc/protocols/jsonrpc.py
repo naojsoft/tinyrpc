@@ -771,7 +771,7 @@ class JSONRPCProtocol(RPCBatchProtocol):
 
         try:
             req = json.loads(data)
-        except Exception as e:
+        except Exception:
             raise JSONRPCParseError()
 
         if isinstance(req, list):
@@ -782,7 +782,7 @@ class JSONRPCProtocol(RPCBatchProtocol):
                     requests.append(self._parse_subrequest(subreq))
                 except RPCError as e:
                     requests.append(e)
-                except Exception as e:
+                except Exception:
                     requests.append(JSONRPCInvalidRequestError(request_id=subreq.get("id")))
 
             if not requests:

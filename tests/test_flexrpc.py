@@ -457,7 +457,6 @@ def _has_working_msgpack_numpy():
     pure-Python fallback writes the element count where the byte count
     belongs.  Only the C extension gets this right."""
     try:
-        import msgpack
         import msgpack_numpy
         import numpy as np
     except ImportError:

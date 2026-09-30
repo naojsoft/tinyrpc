@@ -5,8 +5,7 @@ import json
 
 import pytest
 
-from tinyrpc import MethodNotFoundError, InvalidRequestError, ServerError, \
-                    RPCError, RPCResponse, InvalidReplyError
+from tinyrpc import MethodNotFoundError, InvalidReplyError
 from tinyrpc.protocols.jsonrpc import JSONRPCParseError, \
                                       JSONRPCInvalidRequestError, \
                                       JSONRPCMethodNotFoundError, \
@@ -122,7 +121,7 @@ def test_good_reply_samples(prot, data, id, result):
 def test_unsolicited_reply_raises_error(prot, data):
     prot.expect_reply(4)
     with pytest.raises(InvalidReplyError):
-        reply = prot.parse_reply(data)
+        prot.parse_reply(data)
 
 
 @pytest.mark.parametrize(('exc', 'code', 'message'), [
@@ -138,7 +137,7 @@ def test_unsolicited_reply_raises_error(prot, data):
     #(ServerError, -32603, 'Internal error'),
 ])
 def test_proper_construction_of_error_codes(prot, exc, code, message):
-    request = prot.parse_request(
+    prot.parse_request(
         """{"jsonrpc": "2.0", "method": "sum", "params": [1,2,4],
            "id": "1"}"""
     )
@@ -157,10 +156,10 @@ def test_notification_yields_None_response(prot):
 
     req = prot.parse_request(data)
 
-    assert req.one_way == True
+    assert req.one_way is True
 
     # updates should never cause retries
-    assert req.respond(True) == None
+    assert req.respond(True) is None
 
 
 def test_batch_empty_array(prot):
@@ -199,7 +198,7 @@ def test_batch_good_examples(prot):
 
     assert results[1].method == 'notify_hello'
     assert results[1].args == [7]
-    assert results[1].unique_id == None
+    assert results[1].unique_id is None
 
     assert results[2].method == 'subtract'
     assert results[2].args == [42, 23]
@@ -236,7 +235,7 @@ def test_request_generation(prot):
 
     assert jdata['method'] == 'subtract'
     assert jdata['params'] == [42, 23]
-    assert jdata['id'] != None
+    assert jdata['id'] is not None
     assert jdata['jsonrpc'] == '2.0'
 
 
@@ -500,7 +499,7 @@ def test_jsonrpc_spec_v2_example12(prot):
 
     request = prot.create_batch_request(reqs)
 
-    assert request.create_batch_response() == None
+    assert request.create_batch_response() is None
 
 
 def test_can_get_custom_error_messages_out(prot):
@@ -522,7 +521,7 @@ def test_can_get_custom_error_messages_out(prot):
 
 
 def test_accepts_empty_but_not_none_args_kwargs(prot):
-    request = prot.create_request('foo', args=[], kwargs={})
+    prot.create_request('foo', args=[], kwargs={})
 
 
 def test_missing_jsonrpc_version_on_request(prot):

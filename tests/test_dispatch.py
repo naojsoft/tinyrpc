@@ -7,8 +7,8 @@ import inspect
 
 from tinyrpc.dispatch import RPCDispatcher, public
 from tinyrpc import RPCRequest, RPCBatchRequest, RPCBatchResponse
-from tinyrpc.protocols.jsonrpc import JSONRPCProtocol, JSONRPCInvalidParamsError
-from tinyrpc.exc import *
+from tinyrpc.protocols.jsonrpc import JSONRPCProtocol
+from tinyrpc.exc import InvalidParamsError, MethodNotFoundError
 
 @pytest.fixture
 def dispatch():
@@ -156,7 +156,7 @@ def test_dispatch_calls_method_and_responds(dispatch, mock_request):
     m.subtract = Mock(return_value=-2)
 
     dispatch.add_method(m.subtract, 'subtract')
-    response = dispatch.dispatch(mock_request)
+    dispatch.dispatch(mock_request)
 
     assert m.subtract.called
 
@@ -173,7 +173,7 @@ def test_dispatch_handles_in_function_exceptions(dispatch, mock_request):
     m.subtract.side_effect = MockError('mock error')
 
     dispatch.add_method(m.subtract, 'subtract')
-    response = dispatch.dispatch(mock_request)
+    dispatch.dispatch(mock_request)
 
     assert m.subtract.called
 
@@ -197,7 +197,7 @@ def test_batch_dispatch(dispatch):
 
     assert batch_request.error_respond.call_count == 0
 
-    response = dispatch.dispatch(batch_request)
+    dispatch.dispatch(batch_request)
 
     # assert all methods are called
     method1.assert_called_with(1, 2)
@@ -251,7 +251,7 @@ def test_argument_error(dispatch, invoke_with):
     mock_request.method = method
     dispatch._dispatch(mock_request, getattr(protocol, '_caller', None))
     if inspect.isclass(result) and issubclass(result, Exception):
-        assert type(mock_request.error_respond.call_args[0][0]) == result
+        assert type(mock_request.error_respond.call_args[0][0]) is result
     else:
         mock_request.respond.assert_called_with(result)
 
@@ -346,7 +346,7 @@ def test_bound_method_argument_error(dispatch, invoke_with):
     mock_request.method = method
     dispatch._dispatch(mock_request, getattr(protocol, '_caller', None))
     if inspect.isclass(result) and issubclass(result, Exception):
-        assert type(mock_request.error_respond.call_args[0][0]) == result
+        assert type(mock_request.error_respond.call_args[0][0]) is result
     else:
         mock_request.respond.assert_called_with(result)
 
@@ -386,7 +386,7 @@ def test_unbound_method_argument_error(dispatch, invoke_with):
     mock_request.method = method
     dispatch._dispatch(mock_request, getattr(protocol, '_caller', None))
     if inspect.isclass(result) and issubclass(result, Exception):
-        assert type(mock_request.error_respond.call_args[0][0]) == result
+        assert type(mock_request.error_respond.call_args[0][0]) is result
     else:
         mock_request.respond.assert_called_with(result)
 
@@ -429,7 +429,7 @@ def test_static_method_argument_error(dispatch, invoke_with):
     mock_request.method = method
     dispatch._dispatch(mock_request, getattr(protocol, '_caller', None))
     if inspect.isclass(result) and issubclass(result, Exception):
-        assert type(mock_request.error_respond.call_args[0][0]) == result
+        assert type(mock_request.error_respond.call_args[0][0]) is result
     else:
         mock_request.respond.assert_called_with(result)
 
@@ -474,7 +474,7 @@ def test_class_method_argument_error(dispatch, invoke_with):
     mock_request.method = method
     dispatch._dispatch(mock_request, getattr(protocol, '_caller', None))
     if inspect.isclass(result) and issubclass(result, Exception):
-        assert type(mock_request.error_respond.call_args[0][0]) == result
+        assert type(mock_request.error_respond.call_args[0][0]) is result
     else:
         mock_request.respond.assert_called_with(result)
 
