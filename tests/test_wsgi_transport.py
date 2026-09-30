@@ -1,6 +1,8 @@
 #!/usr/bin/env python
 # -*- coding: utf-8 -*-
 
+import sys
+
 import pytest
 
 
@@ -9,8 +11,6 @@ import gevent.queue
 import gevent.monkey
 from gevent.pywsgi import WSGIServer
 import requests
-
-from importlib import reload
 
 from tinyrpc.transports.wsgi import WsgiServerTransport
 from tinyrpc.transports.http import HttpPostClientTransport
@@ -21,7 +21,6 @@ TEST_SERVER_ADDR = ('127.0.0.1', 49294)
 @pytest.fixture(scope='module', autouse=True)
 def monkey_patches(request):
     # ugh? ugh. ugh. ugh!
-    import socket
     gevent.monkey.patch_all(
         socket=True,
         dns=False,
@@ -34,7 +33,20 @@ def monkey_patches(request):
         aggressive=False)
 
     def fin():
-        reload(socket)
+        # gevent offers no unpatch, and reloading the socket module is worse
+        # than leaving it patched: the reload binds a brand new
+        # _GLOBAL_DEFAULT_TIMEOUT sentinel while http.client goes on holding
+        # the old one, so create_connection stops recognizing it and hands
+        # settimeout() a bare object().  Put the saved originals back in place
+        # instead, which leaves module identity -- and every sentinel gevent
+        # never touched -- alone.
+        for mod_name, attrs in gevent.monkey.saved.items():
+            mod = sys.modules.get(mod_name)
+            if mod is None:
+                continue
+            for attr, original in attrs.items():
+                setattr(mod, attr, original)
+        gevent.monkey.saved.clear()
 
     request.addfinalizer(fin)
 
