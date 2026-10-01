@@ -460,3 +460,94 @@ def test_old_names_still_resolve():
     assert isinstance(kept.packer, TransportPacker)
     assert not isinstance(kept.packer, TransportPackerRobust), \
         "the unframed transport must stay unframed"
+
+
+# ------------------------------------------------- what the loop costs --
+#
+# The demultiplexing loop polls, so how long it is willing to wait decides
+# what a client costs when it is doing nothing.  Measured on a real
+# connection: at a 0.0001s poll an idle client burned 4% of a core, and one
+# whose connection had dropped burned 100% of one, because receive_reply()
+# reports "no socket" immediately rather than waiting.
+
+class CountingTransport:
+    """Counts how often the loop asks, and answers however it is told to.
+
+    ``waits`` is the difference that matters.  A real transport that has a
+    connection waits out the timeout before admitting nothing arrived, so
+    the loop's poll interval is what paces it; one with no connection
+    reports that at once, and then nothing paces the loop but the loop.
+    """
+
+    def __init__(self, raises, waits):
+        self.raises = raises
+        self.waits = waits
+        self.asked = 0
+
+    def send_message_noblock(self, message):
+        pass
+
+    def receive_reply(self, timeout=None):
+        self.asked += 1
+        if self.waits and timeout:
+            time.sleep(timeout)
+        raise self.raises
+
+
+def spin_count(raises, waits, seconds=0.5):
+    """How many times the loop asks the transport in `seconds`."""
+    transport = CountingTransport(raises, waits)
+    client = MultiplexingRPCClient(JSONRPCProtocol(), transport)
+    thread = threading.Thread(target=client.receive_forever, daemon=True)
+    thread.start()
+    time.sleep(seconds)
+    client.stop()
+    thread.join(timeout=5)
+    return transport.asked
+
+
+def test_an_idle_loop_does_not_spin():
+    """Nothing to read is the common case, and it must not cost a core."""
+    asked = spin_count(TimeoutError('nothing waiting'), waits=True)
+
+    assert asked <= 20, (
+        'the loop asked %d times in half a second; it is polling, not '
+        'waiting' % (asked,))
+
+
+def test_a_disconnected_loop_does_not_spin():
+    """Regression.  receive_reply() raises ConnectionError at once when there
+    is no socket to wait on, so without a pause the loop asked as fast as the
+    interpreter could go -- for as long as the connection stayed down, which
+    with nothing dialling again is for ever."""
+    asked = spin_count(ConnectionError('not connected'), waits=False)
+
+    assert asked <= 20, (
+        'the loop asked %d times in half a second with no connection; it is '
+        'spinning' % (asked,))
+
+
+def test_waiting_longer_does_not_delay_a_reply(protocol_cls=JSONRPCProtocol):
+    """The point of the longer wait is that it is free: the transport hands
+    over a reply the moment it has one, so the poll interval bounds only how
+    long the loop takes to notice ev_quit."""
+    protocol = protocol_cls()
+    transport = FakeTransport()
+    client = MultiplexingRPCClient(protocol, transport)
+    thread = threading.Thread(target=client.receive_forever, daemon=True)
+    thread.start()
+    try:
+        pending = client.begin_call('echo', ['hi'], {})
+        request = protocol.parse_request(transport.sent[-1])
+        transport.inbox.append(request.respond('hi').serialize())
+
+        t0 = time.monotonic()
+        response = client.receive_reply(pending, timeout=5)
+        waited = time.monotonic() - t0
+
+        assert response.result == 'hi'
+        assert waited < client._process_timeout, (
+            'took %.3fs to collect a reply that was already there' % waited)
+    finally:
+        client.stop()
+        thread.join(timeout=5)

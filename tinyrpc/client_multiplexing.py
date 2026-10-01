@@ -114,7 +114,6 @@ class MultiplexingRPCClient(RPCClient):
         self.tracking_board = {}
         self.trace = False
         self.ev_quit = threading.Event()
-        self._process_timeout = 0.0001
 
     # ------------------------------------------------------ receive loop --
 
@@ -123,6 +122,20 @@ class MultiplexingRPCClient(RPCClient):
         if self.trace:
             with self.lock:
                 self.logger.debug("tracking %s", list(self.tracking_board))
+
+    #: How long the loop waits for a reply before looking up to re-test
+    #: ev_quit.  A reply does not wait for this: the transport's queue hands
+    #: one over the moment it arrives, so a longer wait adds no latency and
+    #: saves the wakeups.  At 0.0001 the loop woke ten thousand times a
+    #: second to find nothing, which measured 4% of a core per idle client.
+    _process_timeout = 0.25
+
+    #: How long to pause after finding no connection at all.  receive_reply()
+    #: raises ConnectionError immediately in that case rather than waiting,
+    #: so without a pause the loop span: a client whose connection had
+    #: dropped burned a whole core until something dialled again -- and if
+    #: nothing did, indefinitely.
+    _disconnected_pause = 0.1
 
     def process_incoming(self) -> None:
         """Take one reply off the transport and hand it to its pending call.
@@ -144,7 +157,9 @@ class MultiplexingRPCClient(RPCClient):
             # again on the next send, and not worth a traceback every time
             # round a loop that polls -- the calls that were in flight
             # surface as timeouts, which is where the decision to retry
-            # belongs.
+            # belongs.  The pause is what keeps this from becoming a spin,
+            # since there is no socket to wait on.
+            self.ev_quit.wait(timeout=self._disconnected_pause)
             return
         except Exception:
             self.logger.exception("error reading from transport")
