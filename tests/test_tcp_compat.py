@@ -413,6 +413,78 @@ def test_two_messages_that_arrived_together_are_told_apart():
         right.close()
 
 
+def test_a_single_message_read_does_not_strand_the_buffer():
+    """Regression, and the shape is the whole of it: a read holding exactly
+    one message, then a read holding two.
+
+    The first takes feed_whole()'s fast path, which hands the read straight
+    back rather than copying it into buf and moves base to match.  buf may
+    still hold bytes that were handed out earlier -- they are trimmed in
+    batches, not immediately -- and base is the offset of buf[0], so leaving
+    them there while moving base made the two disagree.  The next read with
+    more than one message in it then sliced from the wrong offset and handed
+    back a *previous* message: valid msgpack, parsed happily, matching no
+    outstanding call, so the reply it displaced was lost rather than
+    corrupted.
+
+    Found by a multiplexing client losing about one call in a hundred; it
+    needs no concurrency at all, only the two read shapes in that order.
+    """
+    from tinyrpc.transports.tcp import TransportPackerMsgpack
+
+    left, right = socket.socketpair()
+    try:
+        messages = [msgpack.packb([0, n, 'echo', ['m%d' % n]])
+                    for n in range(6)]
+        packer = TransportPackerMsgpack()
+
+        # One on its own, so the fast path runs and buf is left behind.
+        left.sendall(messages[0])
+        assert packer.recv(right) == messages[0]
+
+        # Two together, which fills buf and leaves consumed bytes in it.
+        left.sendall(messages[1] + messages[2])
+        assert packer.recv(right) == messages[1]
+        assert packer.recv(right) == messages[2]
+
+        # One on its own again: the fast path, with buf now non-empty.
+        left.sendall(messages[3])
+        assert packer.recv(right) == messages[3]
+
+        # Two together again.  This is where the stale bytes came back.
+        left.sendall(messages[4] + messages[5])
+        assert packer.recv(right) == messages[4]
+        assert packer.recv(right) == messages[5]
+    finally:
+        left.close()
+        right.close()
+
+
+def test_the_two_read_shapes_alternating_stay_in_order():
+    """The same fault, at a length where an off-by-one could not pass."""
+    from tinyrpc.transports.tcp import TransportPackerMsgpack
+
+    left, right = socket.socketpair()
+    try:
+        packer = TransportPackerMsgpack()
+        sent = []
+        for round_ in range(40):
+            one = msgpack.packb([0, round_, 'echo', ['single-%d' % round_]])
+            left.sendall(one)
+            sent.append(one)
+            assert packer.recv(right) == sent[-1], 'round %d' % round_
+
+            pair = [msgpack.packb([0, round_, 'echo', ['pair-%d-%d'
+                                                       % (round_, half)]])
+                    for half in (0, 1)]
+            left.sendall(pair[0] + pair[1])
+            assert packer.recv(right) == pair[0], 'round %d' % round_
+            assert packer.recv(right) == pair[1], 'round %d' % round_
+    finally:
+        left.close()
+        right.close()
+
+
 def test_one_packer_keeps_each_connection_s_bytes_apart():
     """A server hands every connection it accepts to the same packer, so
     half a message on one must not be mistaken for part of another."""

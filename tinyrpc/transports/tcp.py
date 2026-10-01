@@ -832,8 +832,19 @@ class _MsgpackStream:
             return None
 
         if self.unpacker.tell() == self.fed:
-            # Exactly one message, nothing left over.  buf stays empty, so
-            # base moves with consumed to keep the offsets in step.
+            # Exactly one message, nothing left over: hand the read straight
+            # back without copying it into buf.
+            #
+            # buf has to be emptied to do that.  It may still hold bytes that
+            # have already been handed out -- next_message() only trims them
+            # in batches -- and base is the stream offset of buf[0], so
+            # moving base to fed while leaving those bytes in place makes the
+            # two disagree.  The next read carrying more than one message
+            # then slices from the wrong offset and hands back a stale
+            # message: not a corrupt one, a *previous* one, which parses
+            # perfectly and matches no outstanding call, so the reply it
+            # displaced is simply lost.
+            del self.buf[:]
             self.consumed = self.fed
             self.base = self.fed
             return data
