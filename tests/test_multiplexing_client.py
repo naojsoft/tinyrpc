@@ -551,3 +551,30 @@ def test_waiting_longer_does_not_delay_a_reply(protocol_cls=JSONRPCProtocol):
     finally:
         client.stop()
         thread.join(timeout=5)
+
+
+@pytest.mark.parametrize('raises,waits,ceiling', [
+    pytest.param(TimeoutError('nothing waiting'), True, 1.0, id='connected'),
+    pytest.param(ConnectionError('not connected'), False, 0.5,
+                 id='disconnected'),
+])
+def test_the_loop_exits_promptly_when_asked_to_stop(raises, waits, ceiling):
+    """The poll interval is also how long stop() can take to take effect, so
+    raising it trades one cost for another.  Connected, the wait is inside
+    the transport and cannot be interrupted, so the bound is one interval;
+    disconnected, the pause waits on ev_quit itself and ends at once."""
+    transport = CountingTransport(raises, waits)
+    client = MultiplexingRPCClient(JSONRPCProtocol(), transport)
+    thread = threading.Thread(target=client.receive_forever, daemon=True)
+    thread.start()
+    time.sleep(0.3)
+
+    t0 = time.monotonic()
+    client.stop()
+    thread.join(timeout=10)
+    took = time.monotonic() - t0
+
+    assert not thread.is_alive(), 'the loop never stopped'
+    assert took < ceiling, 'took %.3fs to stop' % took
+    assert took <= client._process_timeout + 0.25, (
+        'stopping took %.3fs, more than a poll interval' % took)
