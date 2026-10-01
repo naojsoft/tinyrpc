@@ -429,9 +429,14 @@ class NonBlockingTcpClientTransport(NonBlockingClientTransport):
 
     :param endpoint: ``(host, port)`` to connect to.
     :param packer: Framing.  The default is length-prefixed
-        (:py:class:`TransportPackerRobust`).  Framing is not optional here:
-        without a length prefix there is no way to tell where one reply ends
-        and the next begins, and multiplexing depends on that.
+        (:py:class:`TransportPackerRobust`).  What multiplexing needs is a
+        *delimited* stream -- a packer that hands back one whole message at
+        a time -- and a length prefix is one way to get one, not the only
+        way: a self-delimiting encoding already carries the boundaries, and
+        :py:class:`TransportPackerMsgpack` reads them out of an unframed
+        msgpack stream.  :py:class:`TransportPacker` is the one to avoid
+        here, since it hands up whatever a single ``recv()`` returned, which
+        may be half a message or two of them.
     :param connect_timeout: Seconds to allow for establishing a connection.
     :param reconnect_interval: The shortest gap between connection attempts,
         so that a service that is down is not hammered.
@@ -655,9 +660,18 @@ class UnframedTcpClientTransport(NonBlockingTcpClientTransport):
 
     Prefer :py:class:`NonBlockingTcpClientTransport` between two ``tinyrpc``
     ends.  Its length prefix is what makes a reply larger than one read
-    arrive whole -- without it a message that does not fit in a single
-    ``recv()`` arrives in pieces -- and what a multiplexing client needs to
-    tell replies apart.
+    arrive whole: with the default packer here a message that does not fit
+    in a single ``recv()`` arrives in pieces.
+
+    Note that is a property of *this* default rather than of the unframed
+    wire.  Pass ``packer=TransportPackerMsgpack()`` and the same wire reads
+    correctly -- whole messages, one at a time -- which is enough for a
+    multiplexing client, so standard msgpack-RPC can be multiplexed after
+    all.  Give it to the server as well, since a server reads a stream of
+    requests the same way a client reads a stream of replies.  The two ends
+    need not agree on it, though: these packers put identical bytes on the
+    wire and differ only in how each reads them, which is also why a peer
+    that is not ``tinyrpc`` is unaffected by the choice.
 
     For a server that speaks the same unframed format, pass
     ``packer=TransportPacker()`` to
@@ -970,11 +984,15 @@ def default_packer() -> TransportPacker:
     moved to the length-prefixed packer and the client was left behind, and
     a framing mismatch does not raise -- it times out.
 
-    Pass ``packer=TransportPacker()`` to both ends instead to speak the
-    unframed wire format that standard msgpack-RPC over TCP uses.  That is
-    supported on servers as well as clients; the limit is that a message
-    larger than one read arrives in pieces, which is what the prefix exists
-    to fix.
+    To speak the unframed wire format that standard msgpack-RPC over TCP
+    uses, pass a packer that writes no prefix.  Prefer
+    :py:class:`TransportPackerMsgpack`, which finds the boundaries in the
+    msgpack stream itself, on servers as well as clients.
+    :py:class:`TransportPacker` writes the same bytes but hands up whatever
+    one ``recv()`` returned, so a message larger than a read arrives in
+    pieces and two that arrived together arrive as one -- which is what the
+    length prefix exists to fix, and what reading the stream properly fixes
+    without one.
     """
     return TransportPackerRobust()
 
